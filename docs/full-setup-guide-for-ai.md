@@ -3,7 +3,7 @@
 Audience: a Claude Code assistant that sets up the full stack (board, sala, gbrain, this plugin, a starter rulebook, connectors) on the
 user's own Linux box.
 Checked on Fri Nov 6th 2026 by running the steps in a throwaway home directory with no access to any existing setup, against this plugin
-(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The first full run
+(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The current plugin version is 0.1.5. The first full run
 is recorded in [full-setup-run.md](full-setup-run.md).
 `TODO(verify)` marks what those runs could not reach (a Google sign-in, a claude.ai login, root, a public host name, a Postgres server, a
 signed-in session): check it live and tell the user what you found.
