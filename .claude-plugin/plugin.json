@@ -1,0 +1,12 @@
+{
+  "name": "stackshot",
+  "version": "0.1.5",
+  "description": "The stackshot stack's shared Claude Code pieces in one plugin: the board and page-gate hooks, the front-agent build stops, the watch and wait-loop guards, gbrain write-back, the spawn skill and the executor, deep-engineer and sweeper agents.",
+  "author": {
+    "name": "stackshot contributors"
+  },
+  "homepage": "https://github.com/howardpark-ai/stackshot-plugin",
+  "repository": "https://github.com/howardpark-ai/stackshot-plugin",
+  "license": "MIT",
+  "keywords": ["stackshot", "sala", "gbrain", "hooks", "board"]
+}

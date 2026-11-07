@@ -1,0 +1,18 @@
+{
+  "name": "stackshot-plugin",
+  "owner": {
+    "name": "stackshot contributors"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for the stackshot stack: shared hooks, the spawn skill and helper agents."
+  },
+  "plugins": [
+    {
+      "name": "stackshot",
+      "source": "./",
+      "description": "The stackshot stack's shared hooks (board repo guard, build stops, watch and wait-loop guards, page gate, gbrain write-back), the spawn skill and the executor, deep-engineer and sweeper agents.",
+      "version": "0.1.5",
+      "license": "MIT"
+    }
+  ]
+}

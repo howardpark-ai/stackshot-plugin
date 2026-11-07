@@ -1,0 +1,32 @@
+# The neutral-install tests and the tree check (tests/): every hook runs under a temp HOME with no sala and a stub stackshot, and the
+# tree must hold no instance strings. Standard library only. The instance patterns (the owner's names, machines, domains) are not in
+# the repository: the repository SECRET CLEAN_TEXT_DENY (newline-separated regexes, as in clean-text.yml) goes to the one step that runs
+# the tests; without it (a fork's pull request) only the generic patterns run and the tree test says so.
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: scratch goes to the runner's temp folder
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"   # shared runners keep /tmp; the runner empties _temp after each job
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: unit tests
+        env:
+          CLEAN_TEXT_DENY: ${{ secrets.CLEAN_TEXT_DENY }}   # this step only; empty on a fork's pull request, where only the generic patterns run
+        run: uv run --no-project python -m unittest discover -s tests -v
+      - name: plugin manifests
+        run: |
+          python3 -c 'import json; [json.load(open(p)) for p in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "hooks/hooks.json")]'

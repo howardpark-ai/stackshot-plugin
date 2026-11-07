@@ -1,0 +1,110 @@
+{
+  "description": "stackshot stack hooks. Each degrades to allow (one line on stderr) when stackshot or sala is absent; see the README for the settings.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" keeper", "timeout": 20}
+        ]
+      },
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/build-stops.py\"", "timeout": 10}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" nag", "timeout": 30},
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/prompt-stamp.py\"", "timeout": 10}
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/build-stops.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Bash|mcp__.*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/board-repo-guard.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/gbrain-redirect-guard.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-model-gate.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/wait-loop-guard.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "CronCreate|Skill|Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/recurring-job-note.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "SendMessage|mcp__.*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/handoff-item-note.py\"", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "ScheduleWakeup|CronCreate|Monitor|Bash",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/front-watch-gate.py\"", "timeout": 10}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*|SendMessage",
+        "hooks": [
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "if": "Bash(*git*commit*)", "timeout": 10},
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "if": "Bash(*git*push*)", "timeout": 10},
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "if": "Bash(*gh*pr*)", "timeout": 10},
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "if": "Bash(*deploy*.sh*)", "timeout": 10},
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" touch", "if": "Bash(*release*.sh*)", "timeout": 10},
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/build-stops.py\"", "if": "Bash(*merge*)", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Bash|mcp__.*",
+        "hooks": [
+          {"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-note.py\"", "timeout": 10}
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claude-project-page.sh\" check", "timeout": 30},
+          {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/gbrain-writeback-hook.sh\"", "timeout": 10}
+        ]
+      }
+    ]
+  }
+}
