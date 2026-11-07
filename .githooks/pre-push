@@ -10,35 +10,49 @@
 # push by a URL that no configured remote has), every commit reachable from <local sha> is checked: more, not less.
 # A delete (local sha all zeros) is skipped. Merge subjects are skipped by the script, their branch names are not.
 # `git push --no-verify` skips the hook; CI checks again.
+# It then runs the machine's global pre-push hook when there is one (chain-global; a clone's core.hooksPath replaces the global hooks
+# directory, so that hook would not run otherwise). Standard input is read once into a temporary file, removed when the hook ends,
+# and replayed to the check and to the global hook. Both always run, and the hook fails if either fails.
 set -u
-root=$(git rev-parse --show-toplevel) || exit 1
-command -v python3 >/dev/null 2>&1 || { echo "clean-text: python3 is not on PATH; the push was not checked" >&2; exit 1; }
-zero=0000000000000000000000000000000000000000
-remote=${1:-}
-url=${2:-}
-# The remote's name: $1 when it is one, else the configured remote whose URL is $1 or $2, else none.
-scope=
-if [ -n "$remote" ] && git remote get-url "$remote" >/dev/null 2>&1; then
-    scope=$remote
-else
-    for r in $(git remote 2>/dev/null); do
-        for u in $(git remote get-url --all "$r" 2>/dev/null) $(git remote get-url --push --all "$r" 2>/dev/null); do
-            if [ -n "$u" ] && { [ "$u" = "$remote" ] || [ "$u" = "$url" ]; }; then scope=$r; break 2; fi
-        done
-    done
-fi
-status=0
-while read -r local_ref local_sha remote_ref remote_sha; do
-    [ -n "${local_sha:-}" ] || continue
-    case $local_sha in *[!0]*) ;; *) continue ;; esac            # all zeros: a delete
-    name=${remote_ref#refs/heads/}; name=${name#refs/tags/}
-    if [ "${remote_sha:-$zero}" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
-        python3 "$root/tools/clean_text.py" --branch "$name" --commits "$remote_sha..$local_sha" </dev/null >&2 || status=1
-    elif [ -n "$scope" ]; then
-        python3 "$root/tools/clean_text.py" --branch "$name" --new-commits "$local_sha" --remote "$scope" </dev/null >&2 || status=1
+d=$(dirname "$0")
+tmp=$(mktemp "${TMPDIR:-/tmp}/githooks-pre-push.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp"; exit 1' HUP INT TERM
+cat > "$tmp"
+own_check() {
+    root=$(git rev-parse --show-toplevel) || return 1
+    command -v python3 >/dev/null 2>&1 || { echo "clean-text: python3 is not on PATH; the push was not checked" >&2; return 1; }
+    zero=0000000000000000000000000000000000000000
+    remote=${1:-}
+    url=${2:-}
+    # The remote's name: $1 when it is one, else the configured remote whose URL is $1 or $2, else none.
+    scope=
+    if [ -n "$remote" ] && git remote get-url "$remote" >/dev/null 2>&1; then
+        scope=$remote
     else
-        python3 "$root/tools/clean_text.py" --branch "$name" --new-commits "$local_sha" </dev/null >&2 || status=1
+        for r in $(git remote 2>/dev/null); do
+            for u in $(git remote get-url --all "$r" 2>/dev/null) $(git remote get-url --push --all "$r" 2>/dev/null); do
+                if [ -n "$u" ] && { [ "$u" = "$remote" ] || [ "$u" = "$url" ]; }; then scope=$r; break 2; fi
+            done
+        done
     fi
-done
-[ "$status" -eq 0 ] || echo "pre-push: the push was refused; fix the text named above (git rebase -r or git commit --amend), or rename the branch." >&2
+    bad=0
+    while read -r local_ref local_sha remote_ref remote_sha; do
+        [ -n "${local_sha:-}" ] || continue
+        case $local_sha in *[!0]*) ;; *) continue ;; esac            # all zeros: a delete
+        name=${remote_ref#refs/heads/}; name=${name#refs/tags/}
+        if [ "${remote_sha:-$zero}" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+            python3 "$root/tools/clean_text.py" --branch "$name" --commits "$remote_sha..$local_sha" </dev/null >&2 || bad=1
+        elif [ -n "$scope" ]; then
+            python3 "$root/tools/clean_text.py" --branch "$name" --new-commits "$local_sha" --remote "$scope" </dev/null >&2 || bad=1
+        else
+            python3 "$root/tools/clean_text.py" --branch "$name" --new-commits "$local_sha" </dev/null >&2 || bad=1
+        fi
+    done
+    [ "$bad" -eq 0 ] || echo "pre-push: the push was refused; fix the text named above (git rebase -r or git commit --amend), or rename the branch." >&2
+    return "$bad"
+}
+status=0
+own_check "$@" < "$tmp" || status=1
+sh "$d/chain-global" pre-push "$@" < "$tmp" || status=1
 exit "$status"

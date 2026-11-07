@@ -15,6 +15,11 @@ Turn the local checks on once per clone:
 - `.githooks/pre-push` checks the branch name and the new commit messages of a push.
 - CI (`.github/workflows/clean-text.yml`) checks the PR title, body, head branch and commit messages again, as a backstop.
 
+Setting `core.hooksPath` in a clone replaces the machine-wide git hook directory, so the two hooks above also run your own global hook
+of the same name, if there is one (`.githooks/chain-global`: the directory of your global `core.hooksPath`, else
+`${XDG_CONFIG_HOME:-$HOME/.config}/git/hooks`; it runs only when executable, with the same arguments and standard input). Both checks
+always run, and the commit or push is refused if either one refuses.
+
 All three call `tools/clean_text.py`. It always runs the generic patterns (board ids). Your own words to keep out (machine names,
 session names, domains, your name) are a list of regular expressions, one per line, case-insensitive, that is never written into
 the repository: put them in `${XDG_CONFIG_HOME:-$HOME/.config}/stackshot/clean-text-deny` or in the environment variable
