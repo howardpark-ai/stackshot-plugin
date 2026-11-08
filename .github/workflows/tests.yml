@@ -2,11 +2,19 @@
 # tree must hold no instance strings. Standard library only. The instance patterns (the owner's names, machines, domains) are not in
 # the repository: the repository SECRET CLEAN_TEXT_DENY (newline-separated regexes, as in clean-text.yml) goes to the one step that runs
 # the tests; without it (a fork's pull request) only the generic patterns run and the tree test says so.
+# Two merge queues can merge into main, and both need the job `tests` to report:
+#  - GitHub's merge queue runs it on `merge_group`, on the branch GitHub makes for an entry (gh-readonly-queue/main/...).
+#    Do not also list that branch under `push`: the entry would run twice.
+#  - salamander's queue (`salamander mq`, .github/mergequeue.toml) pushes its entries to `queue/main/...` branches, which run it on `push`.
+# Both read the job `tests` as the required check; a check that never reports holds the queue until it times out.
+# Each entry has its own ref, so the concurrency group below is its own and one entry never cancels another.
 name: tests
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'queue/**']
+  merge_group:
+    types: [checks_requested]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

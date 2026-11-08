@@ -6,6 +6,7 @@
 # script, not to the job. When it is empty or unset (a fork's pull request gets no secrets) only the generic patterns run, and the log
 # says the deny list was not available. A hit names a deny pattern by its line number in the secret, never by its text, and never
 # prints the line a deny pattern hit.
+# Pull requests only, on purpose: it reads the PR's title and body, which a merge-queue entry or a queue branch does not have. The queue's required check is `tests` alone.
 name: clean-text
 on:
   pull_request:
