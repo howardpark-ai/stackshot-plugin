@@ -29,7 +29,7 @@ the repository: put them in `${XDG_CONFIG_HOME:-$HOME/.config}/stackshot/clean-t
 
 The tree carries no instance values either: every value that differs per owner (machine names, session names, accounts, domains,
 connector entries) is a setting with a neutral default, read from an environment variable or from
-`${XDG_CONFIG_HOME:-$HOME/.config}/stackshot/plugin.json` (see the README). `tests/test_no_instance_strings.py` fails on a stray one.
+`${XDG_CONFIG_HOME:-$HOME/.config}/stackshot/plugin.json` (see `docs/settings.md`). `tests/test_no_instance_strings.py` fails on a stray one.
 
 ## Tests
 
