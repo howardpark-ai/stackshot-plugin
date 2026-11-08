@@ -7,7 +7,8 @@
 #    Do not also list that branch under `push`: the entry would run twice.
 #  - salamander's queue (`salamander mq`, .github/mergequeue.toml) pushes its entries to `queue/main/...` branches, which run it on `push`.
 # Both read the job `tests` as the required check; a check that never reports holds the queue until it times out.
-# Each entry has its own ref, so the concurrency group below is its own and one entry never cancels another.
+# The concurrency group is per ref. Only a pull request's older run is cancelled by a newer push; a run on main, on a queue/** branch or for a merge-queue entry
+# is never cancelled, so a push to main cannot cancel main's previous run and a queue entry's required check always reports.
 name: tests
 on:
   pull_request:
@@ -17,7 +18,7 @@ on:
     types: [checks_requested]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   tests:
     runs-on: ubuntu-latest
