@@ -85,7 +85,7 @@ memory and gbrain's own steps cover them), anchor-hub, other client machines, th
 
 `item_ref_patterns`, `agent_namespaces`, `stackshot_toml_fallbacks`, `prompt_skip_prefixes`, `portal_prefixes`, `github_entry`,
 `connector_entries`, `workspace_ids`, `gbrain_entries`, `gbrain_moved_banner`, `gbrain_moved_keep`, `gbrain_moved_write_hint`, `gbrain_move_permit_cli`, `gbrain_newpage_patterns`, `gbrain_newpage_org`, `gbrain_newpage_hint`, `gbrain_direct_exclude`, `gbrain_unset_env`, `no_poll_hosts`, `no_poll_note`, `ci_runs_hint`: see the
-plugin README's settings table. Set `portal_prefixes` and the entry ids only if the user runs an MCP portal.
+plugin's settings page (`docs/settings.md`). Set `portal_prefixes` and the entry ids only if the user runs an MCP portal.
 
 ## 4. Procedure
 

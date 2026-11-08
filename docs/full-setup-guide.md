@@ -85,10 +85,10 @@ The plugin works with whatever is installed. A hook that needs stackshot, sala o
 | `owner_name` | `the owner` | Always: your first name. It must equal the board's `[instance] owner` (and sala's `SALA_OWNER_NAME`), because stackshot's router writes `[for <name>]` into prompts and the plugin stamps them. |
 | `build_stops` | `{}` (off) | You want front agents to hand build work to a builder (an object naming each project, its builder session, the guarded repositories). A project is named by its permanent id, `prj_` and eight hex digits; `python3 ~/stackshot/tools/project.py show projects/<slug>` prints it. Leave it off until you run front and builder sessions. The full shape is in the header of `hooks/build-stops.py`. |
 | `item_ref_patterns` | `["\b[a-z][\w-]*#\d+", "/items/[\w-]*\d"]` | Your board writes an item reference another way. |
-| `agent_namespaces` | `["stackshot"]` | You also ship the helper agents from a plugin of your own (the README's "Name resolution"). |
+| `agent_namespaces` | `["stackshot"]` | You also ship the helper agents from a plugin of your own (the "[Name resolution](name-resolution.md)" page). |
 | `gbrain_unset_env` | `[]` | gbrain's child process must not see some variables (for example a metered model key you keep away from it). |
 
-The rest (`portal_prefixes`, `connector_entries`, `no_poll_hosts`, `ci_runs_hint` and others) are in the [README's settings table](../README.md#settings). An example `~/.config/stackshot/plugin.json` for a new setup:
+The rest (`portal_prefixes`, `connector_entries`, `no_poll_hosts`, `ci_runs_hint` and others) are in the [settings page](settings.md). An example `~/.config/stackshot/plugin.json` for a new setup:
 
 ```json
 {
@@ -213,7 +213,7 @@ Good result: the plugin is enabled; `doctor` ends with `all good` and exits 0 on
 
 ## 4. What each hook does
 
-The plugin's hooks, in plain words. Every one allows the call when what it needs is missing, and a refusal always names what to change. The [README](../README.md) has the table of what is optional and the full settings.
+The plugin's hooks, in plain words. Every one allows the call when what it needs is missing, and a refusal always names what to change. The [what-is-optional page](optional-parts.md) has the table of what is optional, and the [settings page](settings.md) has the full settings.
 
 | Piece | What it does |
 |---|---|
@@ -242,7 +242,7 @@ The plugin is shared: a fix for one person reaches everyone at the next update. 
 - **Never copy the plugin's hooks into `settings.json`.** Both would run. That is also why step 1 skips `client install`.
 - **Put your own hooks in `~/.claude/settings.json`** (they run next to the plugin's) or, if you want them versioned and shared between your machines, in a small plugin of your own in your own repository, installed the same way as this one.
 - **Put your own instructions in your rulebook** (step 6), not in a hook, when words are enough.
-- If you ship helper agents of your own under the same names, the `agent_namespaces` setting lets both names answer while you move over (README, "Name resolution").
+- If you ship helper agents of your own under the same names, the `agent_namespaces` setting lets both names answer while you move over ("[Name resolution](name-resolution.md)").
 
 Habits typically kept personal: reply language, how times are written, a question-picker rule, which commands are pre-approved, notes about particular files.
 
