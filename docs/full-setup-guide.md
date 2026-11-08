@@ -5,7 +5,7 @@ Scope: the full setup, which is the board (stackshot), the session manager (sala
 and the connectors, layered on the two guides that already exist. This guide does not repeat them; it links to them and says what
 changes when the pieces run together.
 Checked on Fri Nov 6th 2026 by running the steps in a throwaway home directory with no access to any existing setup, against this plugin
-(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The current plugin version is 0.1.5. The first full run
+(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The current plugin version is 0.1.6. The first full run
 is recorded in [full-setup-run.md](full-setup-run.md).
 Lines marked `TODO(verify)` are things those runs could not reach: a Google sign-in, a claude.ai login, root, a public host name, a gbrain
 database server, or a signed-in Claude Code session.
@@ -83,7 +83,7 @@ The plugin works with whatever is installed. A hook that needs stackshot, sala o
 |---|---|---|
 | `stackshot_dir` (env `STACKSHOT_DIR`) | `~/stackshot` | The board's checkout is somewhere else. The page gate and the guards import stackshot's code from it. |
 | `owner_name` | `the owner` | Always: your first name. It must equal the board's `[instance] owner` (and sala's `SALA_OWNER_NAME`), because stackshot's router writes `[for <name>]` into prompts and the plugin stamps them. |
-| `build_stops` | `{}` (off) | You want front agents to hand build work to a builder (an object naming each project, its builder session, the guarded repositories). A project is named by its permanent id, `prj_` and eight hex digits; `python3 ~/stackshot/tools/project.py show projects/<slug>` prints it. Leave it off until you run front and builder sessions. The full shape is in the header of `hooks/build-stops.py`. |
+| `build_stops` | `{}` (off) | You want front agents to hand build work to a builder (an object naming each project, its builder session, the guarded repositories). A project is named by its permanent id, `prj_` and eight hex digits; `python3 ~/stackshot/stackshot/tools/project.py show projects/<slug>` prints it. Leave it off until you run front and builder sessions. The full shape is in the header of `hooks/build-stops.py`. |
 | `item_ref_patterns` | `["\b[a-z][\w-]*#\d+", "/items/[\w-]*\d"]` | Your board writes an item reference another way. |
 | `agent_namespaces` | `["stackshot"]` | You also ship the helper agents from a plugin of your own (the "[Name resolution](name-resolution.md)" page). |
 | `gbrain_unset_env` | `[]` | gbrain's child process must not see some variables (for example a metered model key you keep away from it). |

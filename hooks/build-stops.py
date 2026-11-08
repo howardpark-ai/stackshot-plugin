@@ -69,7 +69,6 @@ HOME = os.path.expanduser("~")
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "build-stops")
 ROLES = os.environ.get("BUILD_STOPS_ROLES") or os.path.join(HOME, ".local/state/stackshot/roles.json")
 PROJECTS_FILE = os.environ.get("BUILD_STOPS_PROJECTS") or os.path.join(HOME, ".local/state/stackshot/projects.json")
-STACKSHOT = _config.stackshot_dir()
 TAG = "(build-stops.py)"
 
 
@@ -583,10 +582,11 @@ def out(event, **fields):
 def push(to, sender, text):
     """stackshot's push.py, detached: the hook never waits for the delivery (push.py --from <sender> <to> <text>)."""
     cmd = os.environ.get("BUILD_STOPS_PUSH")
-    if not cmd and not os.path.isfile(os.path.join(STACKSHOT, "push.py")):
+    push_py = "" if cmd else _config.stackshot_module_path("push")
+    if not cmd and not push_py:
         _config.note("build-stops", "stackshot's push.py was not found (set STACKSHOT_DIR); the merge notice was not sent")
         return
-    argv = (cmd.split() if cmd else [sys.executable, os.path.join(STACKSHOT, "push.py")]) + ["--from", sender, to, text]
+    argv = (cmd.split() if cmd else [sys.executable, push_py]) + ["--from", sender, to, text]
     os.makedirs(STATE, exist_ok=True)
     lf = open(os.path.join(STATE, "push.log"), "ab")
     env = dict(os.environ, ANCHOR_PUSH_SOURCE="msg")

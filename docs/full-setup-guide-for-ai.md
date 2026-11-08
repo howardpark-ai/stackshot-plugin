@@ -3,7 +3,7 @@
 Audience: a Claude Code assistant that sets up the full stack (board, sala, gbrain, this plugin, a starter rulebook, connectors) on the
 user's own Linux box.
 Checked on Fri Nov 6th 2026 by running the steps in a throwaway home directory with no access to any existing setup, against this plugin
-(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The current plugin version is 0.1.5. The first full run
+(version 0.1.2), the stackshot and salamander of that day, gbrain `0.60.583.0` and Claude Code 2.1.318. Later versions of the plugin and of gbrain were not re-run. The current plugin version is 0.1.6. The first full run
 is recorded in [full-setup-run.md](full-setup-run.md).
 `TODO(verify)` marks what those runs could not reach (a Google sign-in, a claude.ai login, root, a public host name, a Postgres server, a
 signed-in session): check it live and tell the user what you found.
@@ -61,7 +61,7 @@ memory and gbrain's own steps cover them), anchor-hub, other client machines, th
 | Failure mode | A hook whose dependency is missing allows the call and writes one stderr line; any error is a silent exit 0; a refusal is `deny`, never `ask` |
 | Board checkout | `~/stackshot` (`stackshot_dir` / `STACKSHOT_DIR`); board config `~/.config/stackshot/stackshot.toml`. Update it with `./deploy.sh`, never a `git pull` first (board guide, section 6) |
 | Brief hook | `bash ~/stackshot/client/hooks/session-start.sh` (stackshot's own; prints the board's brief, then the page keeper's note; falls back to the data repository when the server is down). The plugin's `SessionStart` keeper hook prints the same note, so a session that keeps a page sees it twice: harmless, and not a reason to drop either hook |
-| Page gate | the plugin's `hooks/claude-project-page.sh <keeper\|nag\|touch\|check>` forwards to `~/stackshot/pages.py`. `./stackshot client install` writes the same verbs into `settings.json`: never both |
+| Page gate | the plugin's `hooks/claude-project-page.sh <keeper\|nag\|touch\|check>` forwards to stackshot's `pages.py` (`~/stackshot/stackshot/projects/pages.py`, or `~/stackshot/pages.py` in a checkout that predates the package). `./stackshot client install` writes the same verbs into `settings.json`: never both |
 | gbrain | upstream `github.com/garrytan/gbrain`, MIT; needs `bun` 1.4.4+; install `bun install -g github:garrytan/gbrain#latest-stable`; home `~/.gbrain` |
 | gbrain keyless start | `gbrain init --pglite --no-embedding`: local file database, keyword search, no model call. PGLite admits one process at a time |
 | gbrain for Claude Code | `gbrain setup claude-code` (`--dry-run` first, `--remove` undoes): stdio MCP entry in `~/.claude.json` (the memory verbs, `serve --surface starter`), hooks `SessionStart` and `UserPromptSubmit` in `~/.claude/settings.json` (command `gbrain hook session-start` / `user-prompt`), a brain-first block between markers in `~/.claude/CLAUDE.md`, a receipt `~/.gbrain-connection-claude-code-gbrain.json`. Its plan has two decisions, `capture` (gbrain's own Stop and SessionEnd hooks and transcript capture) and `providers` (a paid model), both declined by default. Needs `~/.claude/` to exist |
@@ -78,7 +78,7 @@ memory and gbrain's own steps cover them), anchor-hub, other client machines, th
 |---|---|---|
 | `plugin.json` | `owner_name` | the user's first name, equal to the board's `[instance] owner` |
 | `plugin.json` | `stackshot_dir` | only if the board is not at `~/stackshot` |
-| `plugin.json` | `build_stops` | only if they run front and builder sessions: ask for each project's short name, builder session and guarded repositories; the project's permanent id (`prj_` and eight hex digits) is `python3 ~/stackshot/tools/project.py show projects/<slug>` (`hooks/build-stops.py` header has the shape). Otherwise leave out |
+| `plugin.json` | `build_stops` | only if they run front and builder sessions: ask for each project's short name, builder session and guarded repositories; the project's permanent id (`prj_` and eight hex digits) is `python3 ~/stackshot/stackshot/tools/project.py show projects/<slug>` (`hooks/build-stops.py` header has the shape). Otherwise leave out |
 | rulebook | nothing, unless they dictate rules | leave the template as it is; write only the rules they dictate |
 
 ### Leave at the defaults
