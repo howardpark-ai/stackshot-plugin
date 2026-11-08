@@ -129,13 +129,36 @@ def reason(stdout):
     return json.loads(stdout)["hookSpecificOutput"].get("permissionDecisionReason", "") if stdout.strip() else ""
 
 
-def make_stub_stackshot(parent, catalog=True):
+# The layout make_stub_stackshot uses when a test does not name one; test_package_layout.py runs the hook tests again with "package".
+LAYOUT = "root"
+
+# Where stackshot's package keeps the modules the hooks use (the stand-in's own copy of the map; the plugin keeps none).
+STUB_AREAS = {"connectors": "fleet", "push": "fleet", "config": "core", "pages": "projects"}
+
+
+def place_stub_module(d, module, text, layout="root"):
+    """Write the stand-in module `module` into the checkout `d`: at its root (an older checkout, layout "root") or as
+    stackshot/<area>/<module>.py (layout "package", with the __init__.py files that make it a package)."""
+    if layout == "package":
+        folder = os.path.join(d, "stackshot", STUB_AREAS[module])
+        os.makedirs(folder, exist_ok=True)
+        for init in (os.path.join(d, "stackshot", "__init__.py"), os.path.join(folder, "__init__.py")):
+            if not os.path.exists(init):
+                open(init, "w", encoding="utf-8").close()
+    else:
+        folder = d
+    with open(os.path.join(folder, module + ".py"), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def make_stub_stackshot(parent, catalog=True, layout=None):
     """A stand-in for a stackshot checkout in `parent`/stackshot: just enough of connectors.py, config.py, pages.py and push.py for the
-    hooks. With catalog=False its connectors.py has no connector catalog (load_catalog() is None). Returns its path."""
+    hooks, laid out as an older checkout (layout "root") or as the package (layout "package"). With catalog=False its connectors.py
+    has no connector catalog (load_catalog() is None). Returns its path."""
+    layout = layout or LAYOUT
     d = os.path.join(parent, "stackshot")
     os.makedirs(d)
-    with open(os.path.join(d, "connectors.py"), "w", encoding="utf-8") as f:
-        f.write('''
+    connectors = ('''
 import collections, re
 Res = collections.namedtuple("Res", "route calls")
 Call = collections.namedtuple("Call", "server tool args clean")
@@ -170,14 +193,11 @@ def read_script(code, catalog):
     return calls, problems
 ''')
     if not catalog:
-        with open(os.path.join(d, "connectors.py"), "a", encoding="utf-8") as f:
-            f.write("\nCATALOG = None\n")
-    with open(os.path.join(d, "config.py"), "w", encoding="utf-8") as f:
-        f.write('import os\n\ndef fleet_dir():\n    return os.path.join(os.path.expanduser("~"), "fleet-stub")\n')
-    with open(os.path.join(d, "pages.py"), "w", encoding="utf-8") as f:
-        f.write('import sys\nsys.stdin.read()\nprint("pages-stub " + " ".join(sys.argv[1:]))\n')
-    with open(os.path.join(d, "push.py"), "w", encoding="utf-8") as f:
-        f.write('import os, sys\nopen(os.environ["PUSH_OUT"], "w").write(" ".join(sys.argv[1:]))\n')
+        connectors += "\nCATALOG = None\n"
+    place_stub_module(d, "connectors", connectors, layout)
+    place_stub_module(d, "config", 'import os\n\ndef fleet_dir():\n    return os.path.join(os.path.expanduser("~"), "fleet-stub")\n', layout)
+    place_stub_module(d, "pages", 'import sys\nsys.stdin.read()\nprint("pages-stub " + " ".join(sys.argv[1:]))\n', layout)
+    place_stub_module(d, "push", 'import os, sys\nopen(os.environ["PUSH_OUT"], "w").write(" ".join(sys.argv[1:]))\n', layout)
     return d
 
 

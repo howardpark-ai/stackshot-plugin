@@ -6,7 +6,7 @@ default. Claude Code passes the `env` block of `settings.json` to hooks, so eith
 
 | Setting (file key; env `STACKSHOT_PLUGIN_<NAME>`) | Default | Read by | What it is |
 |---|---|---|---|
-| `stackshot_dir` (env `STACKSHOT_DIR`, stackshot's own name) | `~/stackshot` | page gate, `board-repo-guard`, `gbrain-redirect-guard`, `post-tool-note`, `build-stops` | The stackshot checkout whose `pages.py`, `connectors.py`, `config.py` and `push.py` the hooks use. |
+| `stackshot_dir` (env `STACKSHOT_DIR`, stackshot's own name) | `~/stackshot` | page gate, `board-repo-guard`, `gbrain-redirect-guard`, `post-tool-note`, `build-stops` | The stackshot checkout whose `pages.py`, `connectors.py`, `config.py` and `push.py` the hooks use. Each is looked for at `stackshot/<area>/<module>.py` first, then at `<module>.py` in the checkout's root (a checkout from before stackshot became a package). |
 | `STACKSHOT_CONFIG` / `BOARD_MCP_CONFIG` (stackshot's own) | none | `board-repo-guard` | The `stackshot.toml` that holds `[github] issues_repo` (and, optionally, `issues_repo_aliases` and the repo's numeric `issues_repo_id`); else `$XDG_CONFIG_HOME/stackshot/stackshot.toml`, then `$STACKSHOT_DIR/stackshot.toml`. |
 | `stackshot_toml_fallbacks` | `[]` | `board-repo-guard` | More paths of `stackshot.toml` to try, last. |
 | `agent_namespaces` | `["stackshot"]` | `subagent-model-gate` | Plugin names under which the helper agents answer (`<name>:deep-engineer`); see "[Name resolution](name-resolution.md)". |

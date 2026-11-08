@@ -9,6 +9,7 @@ Two settings keep the names stackshot itself uses: STACKSHOT_DIR (the stackshot 
 
 Nothing here raises: a missing or unreadable file is the same as no file. Stdlib only.
 """
+import importlib
 import json
 import os
 import sys
@@ -88,9 +89,37 @@ def stackshot_dir():
     return os.path.expanduser(os.environ.get("STACKSHOT_DIR") or get_str("stackshot_dir") or "~/stackshot")
 
 
+def _locate(d, module):
+    """Where the stackshot checkout `d` keeps its module `module`: (file path, dotted import name) or None. The package layout comes
+    first: <d>/stackshot/<area>/<module>.py (or <d>/stackshot/<module>.py), found by looking in each area folder, so no list of areas is
+    kept here and a module that moves between areas is still found. A checkout that predates the package holds <d>/<module>.py."""
+    pkg = os.path.join(d, "stackshot")
+    if os.path.isfile(os.path.join(pkg, "__init__.py")):
+        if os.path.isfile(os.path.join(pkg, module + ".py")):
+            return os.path.join(pkg, module + ".py"), "stackshot." + module
+        try:
+            areas = sorted(e.name for e in os.scandir(pkg) if e.is_dir() and e.name.isidentifier())
+        except OSError:
+            areas = []
+        for area in areas:
+            path = os.path.join(pkg, area, module + ".py")
+            if os.path.isfile(path):
+                return path, f"stackshot.{area}.{module}"
+    old = os.path.join(d, module + ".py")
+    return (old, module) if os.path.isfile(old) else None
+
+
+def stackshot_module_path(module):
+    """The file of stackshot's module `module` (pages, push, connectors ...) in the checkout, or "" when it has none."""
+    found = _locate(stackshot_dir(), module)
+    return found[0] if found else ""
+
+
 def stackshot_has(filename):
-    """True when the stackshot checkout holds `filename`."""
-    return os.path.isfile(os.path.join(stackshot_dir(), filename))
+    """True when the stackshot checkout holds `filename`: a module (`push.py`, found in either layout) or any other file at its root."""
+    if os.path.isfile(os.path.join(stackshot_dir(), filename)):
+        return True
+    return filename.endswith(".py") and os.sep not in filename and bool(stackshot_module_path(filename[:-3]))
 
 
 def note(hook, text):
@@ -107,15 +136,17 @@ def note(hook, text):
 
 def import_stackshot(module, hook, quiet=False):
     """stackshot's module `module` (connectors, config ...) imported from the checkout, or None with one line of note (none when
-    `quiet`) when the checkout or the module is absent or does not import. The checkout's folder is on sys.path only while it imports."""
+    `quiet`) when the checkout or the module is absent or does not import. A checkout with the stackshot package is imported as
+    stackshot.<area>.<module>, an older one as the root module. The checkout's folder is on sys.path only while it imports."""
     d = stackshot_dir()
-    if not os.path.isfile(os.path.join(d, module + ".py")):
+    found = _locate(d, module)
+    if not found:
         if not quiet:
             note(hook, f"stackshot's {module}.py was not found (set STACKSHOT_DIR to the stackshot checkout); going on without it")
         return None
     sys.path.insert(0, d)
     try:
-        return __import__(module)
+        return importlib.import_module(found[1])
     except BaseException as e:
         if not quiet:
             note(hook, f"stackshot's {module}.py could not be imported ({e.__class__.__name__}); going on without it")
@@ -128,9 +159,15 @@ def import_stackshot(module, hook, quiet=False):
 
 
 def _cli(argv):
-    """For the shell hooks:  _config.py get NAME | list NAME | stackshot-dir. Prints the value (one list item per line)."""
+    """For the shell hooks:  _config.py get NAME | list NAME | stackshot-dir | stackshot-path MODULE. Prints the value (one list item
+    per line); stackshot-path prints the module's file and exits 1 when the checkout has none."""
     if argv[:1] == ["stackshot-dir"]:
         print(stackshot_dir())
+    elif argv[:1] == ["stackshot-path"] and len(argv) == 2:
+        path = stackshot_module_path(argv[1])
+        if not path:
+            return 1
+        print(path)
     elif argv[:1] == ["get"] and len(argv) == 2:
         print(get_str(argv[1]))
     elif argv[:1] == ["list"] and len(argv) == 2:
