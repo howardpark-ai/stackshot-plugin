@@ -38,6 +38,13 @@ connector entries) is a setting with a neutral default, read from an environment
 Each test makes its own temporary folder under a lock and removes it when it ends, pass or fail. A test never kills a process by
 name and never touches the real home directory.
 
+## Merging a pull request
+
+Pull requests reach `main` through a merge queue, never by a direct push. GitHub's merge queue is the one in use: a queued pull
+request is merged together with `main` on a temporary branch, the `tests` check runs there, and `main` moves only when it passes.
+The repository also carries `.github/mergequeue.toml` and runs CI on `queue/**` branches, so a self-hosted queue that pushes
+those branches can take over without a change to the tree.
+
 ## Releasing a change
 
 A change reaches an installed copy only when the version changes. `claude plugin update` compares the declared version, so a merge
