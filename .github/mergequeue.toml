@@ -1,0 +1,10 @@
+# The rules of salamander's merge queue (`salamander mq`) for this repository. It is read from main's tip at the start of each queue run, so a pull request cannot change its own rules.
+# GitHub's merge queue is the other way to merge here; both are supported and tests.yml reports `tests` for each. Which one runs is set on the host and in the repository's rulesets, not in this file.
+
+base = "main"                  # the branch PRs target and the queue's entries are built on
+
+# Each waiting PR is its own entry, built on the entry ahead of it, and all are tested at once; the entries merge to main in line order.
+queue_mode = "chain"
+
+required = ["tests"]           # the job the queue reads on an entry's head: the `tests` job of tests.yml
+queue_prefix = "queue/main/"   # must start with queue/ (tests.yml triggers on queue/**) and end with /
