@@ -11,7 +11,7 @@
       "name": "stackshot",
       "source": "./",
       "description": "The stackshot stack's shared hooks (board repo guard, build stops, watch and wait-loop guards, page gate, gbrain write-back), the spawn skill and the executor, deep-engineer and sweeper agents.",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "license": "MIT"
     }
   ]
