@@ -17,6 +17,6 @@ lookup), so they ship together and install with one command.
 | `recurring-job-note` | A note when a session sets up a recurring job (those belong to a scheduler that outlives sessions); optionally also on polling listed hosts. |
 | `gbrain-writeback-hook` | The Stop hook that hands the turn to gbrain's ambient memory write-back, detached. |
 | `gbrain-redirect-guard` | Refuses a gbrain write aimed at a redirect stub left by a page rename, or at a page that has moved to another brain (a pointer page whose banner says so), and names the page to write to. Optionally also refuses creating a new page that belongs on the other brain (off until configured). |
-| `subagent-model-gate` | Build work goes to the `executor` agent (Sonnet); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. |
+| `subagent-model-gate` | Build work goes to the `executor` agent (Sonnet); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. A `fable` model override passes only for design and analysis, on `general-purpose` or `claude` with a `Design:` line. |
 | `spawn` skill | Spawns a named tmux + Claude Code session through `sala spawn`. |
 | agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gates and the briefs refer to. |
