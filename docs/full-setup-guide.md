@@ -228,7 +228,7 @@ The plugin's hooks, in plain words. Every one allows the call when what it needs
 | `recurring-job-note` | A note when a session sets up a recurring job (those belong to a scheduler that outlives sessions, such as a systemd timer made with sala). |
 | `gbrain-writeback-hook` | At the end of a turn, hands it to gbrain's ambient write-back, detached. Does nothing until you turn that on (step 5). |
 | `gbrain-redirect-guard` | Refuses a gbrain write aimed at a redirect stub left by a page rename, or at a page that has moved to another brain (a pointer page whose banner says so), and names the page to write to. Optionally also refuses creating a new page that belongs on the other brain (off until configured). |
-| `subagent-model-gate` | Build work goes to the `executor` agent (a Sonnet-class model); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. |
+| `subagent-model-gate` | Build work goes to the `executor` agent (a Sonnet-class model); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. A `fable` model override passes only for design and analysis, on `general-purpose` or `claude` with a `Design:` line. |
 | `spawn` skill | Starts a named tmux + Claude Code session through `sala spawn`. Says so and stops when sala is missing. |
 | agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gate and the briefs refer to. |
 

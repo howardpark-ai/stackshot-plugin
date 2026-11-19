@@ -7,8 +7,13 @@ executor fell short (repeated mistakes or errors). On every Agent (or older Task
   1. `subagent_type` deep-engineer is refused unless the prompt has a line that starts with `Escalation:` (leading whitespace,
      list markers, a blockquote `>` and bold markers allowed; any case) with some text after it: which executor run, and how it
      fell short.
-  2. A `model` override of opus or fable, or any model id containing either word, is refused on every type, deep-engineer
-     included (its own type sets its model, so it needs no override).
+  2. A `model` override of opus, or any model id containing it, is refused on every type, deep-engineer included (its own type
+     sets its model, so it needs no override). A `model` containing fable is refused too, except for design and analysis work: it
+     passes on `general-purpose`, `claude` or no type (never `fork`, deep-engineer, the executor, the sweeper or any other type)
+     when the prompt has a line that starts with `Design:` (same tolerant line matching as `Escalation:`) with text after it,
+     naming the design or analysis question and its item. Such a pass carries a note as additionalContext: Fable is for design
+     and analysis only, build work stays on the executor agent, and Fable fails on a Bedrock lane (400 data retention), so it
+     works only on a subscription lane.
   3. `general-purpose`, `claude`, `fork` or no type, with no `model` of sonnet or haiku: the call goes on, with a note as
      additionalContext that the subagent inherits the parent's model and that build work goes to the executor agent.
 Every other call passes untouched (executor, sweeper, Explore, Plan ... with no model, or with sonnet or haiku).
@@ -33,11 +38,15 @@ import _config  # noqa: E402
 
 TOOLS = ("Agent", "Task")
 INHERITS = ("", "general-purpose", "claude", "fork")
-OPUS_WORDS = ("opus", "fable")
+OPUS_WORDS = ("opus",)
+FABLE_WORD = "fable"
+FABLE_TYPES = ("", "general-purpose", "claude")
 CHEAP_WORDS = ("sonnet", "haiku")
 TAG = "(subagent-model-gate.py)"
 # a line that starts with "Escalation:" - list markers (-, *, +, bullet, 1., 1)), a blockquote > and **bold** allowed - and has text after it
 ESCALATION = re.compile(r"(?im)^[ \t]*(?:(?:[-*+•>]|\d+[.)])[ \t]*)*(?:\*\*|__)?escalation(?:\*\*|__)?[ \t]*:(.*)$")
+# the same for "Design:" - the design or analysis question and its item
+DESIGN = re.compile(r"(?im)^[ \t]*(?:(?:[-*+•>]|\d+[.)])[ \t]*)*(?:\*\*|__)?design(?:\*\*|__)?[ \t]*:(.*)$")
 
 
 def namespaces():
@@ -55,6 +64,11 @@ def executor_name():
 def has_escalation(prompt):
     """Some `Escalation:` line carries text after it (bold markers and spaces alone are not text)."""
     return any(re.sub(r"[\s*_]", "", mt.group(1)) for mt in ESCALATION.finditer(prompt))
+
+
+def has_design(prompt):
+    """Some `Design:` line carries text after it (bold markers and spaces alone are not text)."""
+    return any(re.sub(r"[\s*_]", "", mt.group(1)) for mt in DESIGN.finditer(prompt))
 
 
 def deny(reason):
@@ -84,10 +98,14 @@ def main():
     model = str(inp.get("model") or "").strip()
     m = model.lower()
     ex = executor_name()
-    if any(w in m for w in OPUS_WORDS):
+    if FABLE_WORD in m and not any(w in m for w in OPUS_WORDS) and kind in FABLE_TYPES and has_design(str(inp.get("prompt") or "")):
+        return note(f"Fable is for design and analysis only; build work stays on {ex} (Sonnet). Fable fails on a Bedrock lane "
+                    f"(400 data retention), so this subagent works only on a subscription lane. {TAG}")
+    if FABLE_WORD in m or any(w in m for w in OPUS_WORDS):
         return deny(f"Refused: model override '{model}' on {stype or 'a subagent with no type'}. Build work goes to {ex} (Sonnet); "
                     f"deep-engineer sets its own model and takes no override (escalation only, with an 'Escalation: ...' line). "
-                    f"Drop the model, or pass model: sonnet or haiku. {TAG}")
+                    f"Drop the model, or pass model: sonnet or haiku. Design or analysis work may use model fable on general-purpose "
+                    f"with a 'Design: <the question and its item>' line. {TAG}")
     if kind in deep_names():
         if not has_escalation(str(inp.get("prompt") or "")):
             return deny(f"Refused: deep-engineer is an escalation only. Send it to {ex} first; escalate only after the executor "
