@@ -581,7 +581,8 @@ class Layout(unittest.TestCase):
                     seen.add(os.path.basename(rel))
         wanted = {"board-repo-guard.py", "build-stops.py", "front-watch-gate.py", "claude-project-page.sh", "prompt-stamp.py",
                   "post-tool-note.py", "wait-loop-guard.py", "recurring-job-note.py", "gbrain-writeback-hook.sh",
-                  "gbrain-redirect-guard.py", "subagent-model-gate.py", "handoff-item-note.py"}
+                  "gbrain-redirect-guard.py", "subagent-model-gate.py", "handoff-item-note.py",
+                  "no-ask-watch.py"}
         self.assertEqual(seen, wanted)
         for a in ("executor", "deep-engineer", "sweeper"):
             text = S.read(os.path.join(root, "agents", a + ".md"))

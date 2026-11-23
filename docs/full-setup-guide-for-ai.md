@@ -57,7 +57,7 @@ memory and gbrain's own steps cover them), anchor-hub, other client machines, th
 | Contents | the hooks of `hooks/hooks.json` (the person's guide, section 4, lists them), the `spawn` skill, agents `executor`, `deep-engineer`, `sweeper` |
 | Needs | `python3` 3.12+ (the board guide's requirement) and `bash` on `PATH`; standard library only |
 | Plugin settings | env `STACKSHOT_PLUGIN_<NAME>`, else key in `${XDG_CONFIG_HOME:-~/.config}/stackshot/plugin.json`, else default. Claude Code passes the `env` block of `settings.json` to hooks |
-| Hook logs | `${XDG_STATE_HOME:-~/.local/state}/build-stops/firings.jsonl`, `.../front-watch-gate/firings.jsonl`, prompt stamps in `.../stackshot/prompts/` |
+| Hook logs | `${XDG_STATE_HOME:-~/.local/state}/build-stops/firings.jsonl`, `.../front-watch-gate/firings.jsonl`, `.../no-ask-watch/firings.jsonl` (plus its `pending.jsonl` and `state.json`; `python3 hooks/no-ask-watch.py --replay [file]` posts the log to stackshot again, idempotently), prompt stamps in `.../stackshot/prompts/` |
 | Failure mode | A hook whose dependency is missing allows the call and writes one stderr line; any error is a silent exit 0; a refusal is `deny`, never `ask` |
 | Board checkout | `~/stackshot` (`stackshot_dir` / `STACKSHOT_DIR`); board config `~/.config/stackshot/stackshot.toml`. Update it with `./deploy.sh`, never a `git pull` first (board guide, section 6) |
 | Brief hook | `bash ~/stackshot/client/hooks/session-start.sh` (stackshot's own; prints the board's brief, then the page keeper's note; falls back to the data repository when the server is down). The plugin's `SessionStart` keeper hook prints the same note, so a session that keeps a page sees it twice: harmless, and not a reason to drop either hook |
