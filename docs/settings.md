@@ -29,6 +29,7 @@ default. Claude Code passes the `env` block of `settings.json` to hooks, so eith
 | `gbrain_direct_exclude` | `[]` | `gbrain-redirect-guard` | Regular expressions (case-insensitive) of direct tool names the hook never looks at, such as the connector of a second brain whose pages the local database does not hold. |
 | `gbrain_unset_env` | `[]` | `gbrain-writeback-hook` | Environment variables removed from gbrain's child process (for a setup that keeps metered API keys away from it). |
 | `no_poll_hosts`, `no_poll_note` | `[]`, a generic line | `recurring-job-note` | Hosts that must never be polled (the leg is off when empty), and the note shown; `{hosts}` is replaced. |
+| `no_ask_phrases` | `["Nothing here needs you", "Nothing new for you", "There's nothing you need to do", "Nothing needs you"]` | `no-ask-watch` | The sign-off phrases (case-insensitive, looked for in the first 400 characters of a front agent's final reply) that mark a turn as one with nothing for the owner. A comma-separated string in the environment is split at commas, so a phrase that holds a comma goes in as a JSON list or in `plugin.json`. An empty list turns the hook off. |
 | `ci_runs_hint` | none | `front-watch-gate` | One sentence naming a command that reads CI results without a GitHub call, shown in the polling refusal. |
 
 ## Moved pages and permits
@@ -60,7 +61,9 @@ Seams that already existed and stay as they were: `GH_REPO`; `BUILD_STOPS_NAME`,
 `BUILD_STOPS_PUSH`, `STACKSHOT_FLEET_DIR`; `SALA_HEARTBEAT_STATE_DIR`, `SALA_SESSION_ID`; `GBRAIN_WRITEBACK_BIN`, `GBRAIN_BIN`,
 `GBRAIN_DB`, `PSQL_BIN`, `GBRAIN_REDIRECT_BUDGET`; `XDG_CONFIG_HOME`, `XDG_STATE_HOME`. The hooks keep their logs under
 `$XDG_STATE_HOME` (default `~/.local/state`): `build-stops/firings.jsonl`, `front-watch-gate/firings.jsonl`, and the stamps in
-`stackshot/prompts/`.
+`stackshot/prompts/`. `no-ask-watch` keeps its own folder, `no-ask-watch/` (`firings.jsonl`, the log of every catch, one JSON line each: `t` in UTC, `pane`,
+`kind`, `sender`, `outcome`; `pending.jsonl`, the posts that failed and wait to be retried; `state.json`, the hourly fold). `python3 hooks/no-ask-watch.py --replay [file]`
+posts the `sent` and `folded` lines of that log (or of another file) to stackshot again; stackshot ignores a record it already has, so it is safe to run twice.
 
 An example `plugin.json` (replace `prj_<8 hex>` with the project's permanent id, `prj_` and eight hex digits):
 
