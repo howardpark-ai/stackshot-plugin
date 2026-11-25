@@ -53,30 +53,6 @@ variable is split at commas unless it is JSON, so a regex that contains a comma 
 matched, a regex is never run on a slug longer than 300 characters, and the whole hook ends (the call goes on) after
 `GBRAIN_REDIRECT_BUDGET` + 1 seconds, so a pathological pattern cannot hold a tool call.
 
-## A lookup command
-
-By default the guard asks a `psql` on this box (database `GBRAIN_DB`), else the gbrain CLI, whether a page exists, is a stub or carries
-the pointer banner. When the brain's database is somewhere else, a local copy is stale or empty, and its answers are wrong: a page
-that exists looks new. Set `gbrain_lookup_command` and the guard runs that command instead, and only that command: neither the local
-`psql` nor the CLI is ever consulted, even when the command fails. The command is yours (typically an `ssh` to the database host that
-runs `psql` there).
-
-The contract:
-
-- **stdin** is one JSON object, `{"sql": "<script>", "variables": {"rows": "<json>", "banner": "<regex>"}}`. The script is for `psql`: it
-  reads the variables as `:'rows'` and `:'banner'`, runs in a read-only transaction, selects one row per page found and ends with a
-  select of one line, `lookup-complete-<random hex>`, new on every run.
-- **The command** runs the script on the live database with `psql -X -q -A -t -F <tab> -v ON_ERROR_STOP=1`, each entry of `variables` set
-  as `-v name=value`, and prints what `psql` printed to **stdout**, exit status 0. Its stderr is discarded.
-- **Time**: the command gets what is left of `GBRAIN_REDIRECT_BUDGET` (2 s). It runs in its own process group; at the deadline, or when
-  the hook's own timer ends the hook, the whole group is killed, so an `ssh` it started does not outlive the hook.
-- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, or prints rows that are not followed by this
-  run's end line as the last line, tells the guard nothing, and every call goes on. The end line is what separates "the page does not
-  exist" from "the command did not run the script" (an exit 0 with no output): a page counts as new, and the new-page check refuses
-  it, only when the end line shows the query ran to its end and found no row.
-
-An unset or empty setting keeps the lookup above exactly as it was.
-
 The way through (the move itself, or a write that belongs on this brain) is a permit: a file `<id>.json` in
 `${XDG_STATE_HOME:-$HOME/.local/state}/gbrain-move-permits/` holding `{"slugs": ["a/b"], "expires": <epoch seconds>}`. Each slug covers
 the page and its sub-pages; an expired or unreadable file is ignored. Writing the file is your own tool's job (name its command in
@@ -104,3 +80,27 @@ An example `plugin.json` (replace `prj_<8 hex>` with the project's permanent id,
   }
 }
 ```
+
+## A lookup command
+
+By default the guard asks a `psql` on this box (database `GBRAIN_DB`), else the gbrain CLI, whether a page exists, is a stub or carries
+the pointer banner. When the brain's database is somewhere else, a local copy is stale or empty, and its answers are wrong: a page
+that exists looks new. Set `gbrain_lookup_command` and the guard runs that command instead, and only that command: neither the local
+`psql` nor the CLI is ever consulted, even when the command fails. The command is yours (typically an `ssh` to the database host that
+runs `psql` there).
+
+The contract:
+
+- **stdin** is one JSON object, `{"sql": "<script>", "variables": {"rows": "<json>", "banner": "<regex>"}}`. The script is for `psql`: it
+  reads the variables as `:'rows'` and `:'banner'`, runs in a read-only transaction, selects one row per page found and ends with a
+  select of one line, `lookup-complete-<random hex>`, new on every run.
+- **The command** runs the script on the live database with `psql -X -q -A -t -F <tab> -v ON_ERROR_STOP=1`, each entry of `variables` set
+  as `-v name=value`, and prints what `psql` printed to **stdout**, exit status 0. Its stderr is discarded.
+- **Time**: the command gets what is left of `GBRAIN_REDIRECT_BUDGET` (2 s). It runs in its own process group; at the deadline, or when
+  the hook's own timer ends the hook, the whole group is killed, so an `ssh` it started does not outlive the hook.
+- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, or prints rows that are not followed by this
+  run's end line as the last line, tells the guard nothing, and every call goes on. The end line is what separates "the page does not
+  exist" from "the command did not run the script" (an exit 0 with no output): a page counts as new, and the new-page check refuses
+  it, only when the end line shows the query ran to its end and found no row.
+
+An unset or empty setting keeps the lookup above exactly as it was.
