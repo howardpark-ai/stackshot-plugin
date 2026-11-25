@@ -39,8 +39,44 @@ lookup says it is not there, never when it could not look.
 Only the portal entries listed in the setting gbrain_entries (default `gbrain`) are covered, since the lookup reads this box's own
 gbrain database: a second brain served by another host needs its own lookup first, and stays out.
 
+A brain whose database is not on this box (the local psql and CLI read a stale copy, or none) is looked up by a command of your own:
+the setting gbrain_lookup_command. When it is set the hook runs exactly that command for the lookup and neither the local psql nor
+the gbrain CLI is ever consulted; when it is unset the lookup is the one above, unchanged. The contract with the command:
+  * argv: the setting, a JSON list of strings (or one plain string, split like a shell would); `~` in the first word is expanded.
+    No shell is involved on this side. Unset means null, false, an empty list, an empty or whitespace-only string. Any other value
+    that is not a command (0, {}, a list with a non-string or with a blank first word, an unterminated quote) is "set but unusable":
+    nothing is looked up, no local database is read, and one stderr note says the setting is not a command.
+  * stdin: one JSON object {"sql": "<script>", "variables": {"rows": "<json>", "banner": "<regex>"}}. The script is for psql: it
+    refers to the variables as :'rows' and :'banner', opens a read-only transaction, selects one row per page found and ends with
+    a select of a line that names this run, `lookup-complete-<random hex>`. The command runs the script on the live database with
+    psql's variables set from "variables" (`psql -v name=value`), unaligned, tuples-only, tab-separated (`-A -t -F <tab>`),
+    stopping at the first error (`-v ON_ERROR_STOP=1`).
+  * every value in "variables" is untrusted text: "rows" holds page slugs a model wrote, so a slug can be anything (a quote, a
+    semicolon, a newline), and real slugs are not ASCII-only, so they are not filtered. The command must never put one into a
+    shell string, local or remote (`ssh host "psql -v rows='$rows'"` runs a slug such as  x'; touch f; echo '  on the database host).
+    Pass each word as its own argument, and for a remote shell quote every word that passes through ssh with shlex.quote (ssh joins
+    its words with spaces and hands them to the remote shell), or base64-encode the value on this side and decode it in a fixed
+    script on the far side. docs/settings.md has the recipe.
+  * stdout: exactly what psql printed (the rows, then the end line), at most 1 MB (more is a failure; the hook stops reading and
+    ends the command); exit status 0. stderr is discarded.
+  * The command gets what is left of the budget (GBRAIN_REDIRECT_BUDGET, 2 s) and runs in its own process group, in the home
+    folder: when the time is up, or the hook is ended by its own timer, or it prints too much, the hook kills the command's process
+    group. A process that left the group (its own session) survives, and a command that exits by itself is not followed up, so
+    what it leaves running in the background is its own business. The budget is tight for an ssh that opens a new connection each
+    time: use a persistent one (ControlMaster / ControlPersist) or raise GBRAIN_REDIRECT_BUDGET; a lookup that runs over the
+    budget lets the call through.
+  * Set the command only in the user-level settings or the XDG config file: a repository's .claude/settings.json `env` block can
+    set STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND too, and the command is run as the user.
+  * Fail open: a command that is missing or not executable, exits nonzero, runs out of time, raises, prints more than 1 MB, prints
+    a row of fewer than three columns, or prints rows that are not followed by this run's end line (as the last line) tells the hook
+    nothing about the slugs, so every call goes on, with one short stderr note naming the reason (never the command's output, a
+    slug or a variable). An exit 0 with no output is not "no such page" but "the command did not run the script": only the end line
+    proves the query ran, and a page counts as new (which the third check refuses) only when the query ran and found no row.
+
 Settings (plugin.json key or STACKSHOT_PLUGIN_<NAME>; see the README):
   gbrain_entries            portal entry ids of the gbrain whose database is on this box (default ["gbrain"])
+  gbrain_lookup_command     the command that looks pages up on a brain whose database is not on this box (default unset: the local
+                            psql, then the gbrain CLI); the contract is above
   gbrain_moved_banner       regex of the banner line of a moved page, see BANNER below (default: any "> **...record for this page is in ...")
   gbrain_moved_keep         regexes (case-insensitive) of slugs that are never refused as moved or as a new page of the other brain (default none)
   gbrain_moved_write_hint   a sentence appended to the moved-page refusal, saying how to write on the other brain; {tool}, {slug}
@@ -62,7 +98,7 @@ tool call.
 
 A refusal is a JSON permissionDecision "deny" on stdout with exit 0. Any error: silent exit 0.
 """
-import glob, json, os, re, shutil, signal, subprocess, sys, time
+import glob, json, os, re, selectors, shlex, shutil, signal, subprocess, sys, time, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _config  # noqa: E402
@@ -70,6 +106,7 @@ import _config  # noqa: E402
 BUDGET = float(os.environ.get("GBRAIN_REDIRECT_BUDGET") or 2.0)        # seconds for the whole lookup
 WRITE_TOOLS = ("put_page", "put_pages", "edit_page", "append_page", "add_timeline_entry", "add_tag", "remove_tag", "add_link",
                "remove_link", "put_raw_data", "takes_add", "takes_update", "takes_supersede", "takes_resolve")
+MAX_OUTPUT = 1 << 20                                                    # bytes of stdout read from a lookup command; more is a failure
 MAX_SLUG = 300                                                          # a longer slug is never matched against a setting's regex
 NEW_PAGE_TOOLS = ("put_page", "put_pages")                              # the tools that can create a page
 ORG_ROOTS = ("people", "projects", "companies")                         # the page kinds whose frontmatter `org:` is read
@@ -185,13 +222,9 @@ def merge(old, new):
             "redirect_to": old["redirect_to"] or new["redirect_to"], "banner": old["banner"] or new["banner"]}
 
 
-def lookup_psql(pairs, deadline, banner):
-    """{slug: {exists, type, redirect_to, banner}} of the pages among `pairs`, by one read-only query, a slug it did not find with
-    exists False; None when psql is absent or the query fails."""
-    psql = os.environ.get("PSQL_BIN") or shutil.which("psql")
-    if not psql or not os.path.isfile(psql) or not os.access(psql, os.X_OK):
-        return None
-    rows = json.dumps([{"slug": s, "src": src} for s, src, *_ in pairs])
+def lookup_sql(sentinel=None):
+    """The one read-only lookup, as a psql script that reads the variables `rows` and `banner`. With a `sentinel` it ends with a
+    select of that line, so a caller that did not run the script itself can tell whether it ran to the end."""
     sql = ("\\set ON_ERROR_STOP on\n"
            "begin transaction read only;\n"
            "select p.slug, p.type, coalesce(p.frontmatter->>'redirect_to',''), "
@@ -200,19 +233,20 @@ def lookup_psql(pairs, deadline, banner):
            "on p.slug = w.slug and (w.src is null or p.source_id = w.src) "
            "where p.deleted_at is null;\n"
            "commit;\n")
-    try:
-        r = subprocess.run([psql, "-X", "-q", "-A", "-t", "-F", "\t", "-d", os.environ.get("GBRAIN_DB") or "gbrain",
-                            "-v", "rows=" + rows, "-v", "banner=" + banner], input=sql, capture_output=True, text=True,
-                           env=clean_env(), cwd=os.path.expanduser("~"), timeout=max(0.1, deadline - time.time()))
-    except Exception:
-        return None
-    if r.returncode != 0:
-        _config.note("gbrain-redirect-guard", f"psql exited {r.returncode}, so the gbrain CLI is tried instead; if the setting "
-                     "gbrain_moved_banner is a pattern Postgres rejects, fix it (Python and Postgres read the same pattern)")
-        return None
+    return sql + ("select '%s';\n" % sentinel if sentinel else "")
+
+
+def lookup_rows(pairs):
+    """The psql variable `rows`: the slugs (and their source ids) to look up, as JSON."""
+    return json.dumps([{"slug": s, "src": src} for s, src, *_ in pairs])
+
+
+def parse_rows(pairs, lines):
+    """{slug: {exists, type, redirect_to, banner}} from the tab-separated lines the lookup printed, a slug without a row with
+    exists False. A line of fewer than three columns is skipped."""
     found = {s: dict(NOT_THERE) for s, *_ in pairs}
     seen = {}
-    for line in r.stdout.splitlines():
+    for line in lines:
         cols = line.split("\t")
         if len(cols) < 3:
             continue
@@ -220,6 +254,173 @@ def lookup_psql(pairs, deadline, banner):
                                                   "banner": cols[3].strip() if len(cols) > 3 else ""})
     found.update(seen)
     return found
+
+
+def lookup_psql(pairs, deadline, banner):
+    """{slug: {exists, type, redirect_to, banner}} of the pages among `pairs`, by one read-only query, a slug it did not find with
+    exists False; None when psql is absent or the query fails."""
+    psql = os.environ.get("PSQL_BIN") or shutil.which("psql")
+    if not psql or not os.path.isfile(psql) or not os.access(psql, os.X_OK):
+        return None
+    try:
+        r = subprocess.run([psql, "-X", "-q", "-A", "-t", "-F", "\t", "-d", os.environ.get("GBRAIN_DB") or "gbrain",
+                            "-v", "rows=" + lookup_rows(pairs), "-v", "banner=" + banner], input=lookup_sql(), capture_output=True,
+                           text=True, env=clean_env(), cwd=os.path.expanduser("~"), timeout=max(0.1, deadline - time.time()))
+    except Exception:
+        return None
+    if r.returncode != 0:
+        _config.note("gbrain-redirect-guard", f"psql exited {r.returncode}, so the gbrain CLI is tried instead; if the setting "
+                     "gbrain_moved_banner is a pattern Postgres rejects, fix it (Python and Postgres read the same pattern)")
+        return None
+    return parse_rows(pairs, r.stdout.splitlines())
+
+
+def lookup_command_argv():
+    """The command of the setting gbrain_lookup_command: None when it is unset (null, false, an empty list, an empty or
+    whitespace-only string), else the argument list with `~` in its first word expanded; [] when the setting is set but cannot be
+    a command (0, {}, a list with a non-string or a blank first word, an unterminated quote): then nothing is looked up, no local
+    database is read, and one note says so."""
+    raw = _config.get("gbrain_lookup_command")
+    if raw is None or raw is False or (isinstance(raw, list) and not raw) or (isinstance(raw, str) and not raw.strip()):
+        return None
+    argv = None
+    if isinstance(raw, str):
+        try:
+            argv = shlex.split(raw)
+        except ValueError:
+            pass
+    elif isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+        argv = list(raw)
+    if not argv or not argv[0].strip():
+        _config.note("gbrain-redirect-guard", "the setting gbrain_lookup_command is not a command (a JSON list of strings, or one "
+                     "string); nothing is looked up and every call goes on")
+        return []
+    return [os.path.expanduser(argv[0])] + argv[1:]
+
+
+def _end_group(proc):
+    """Kill the command's whole process group (it was started as its own session, so the group is its pid), close its pipes and reap
+    it. Only while the command has not been reaped: its pid is then still ours. A process that left the group survives; a command
+    that exited by itself (and was reaped) is not followed up."""
+    if proc.returncode is None:
+        try:
+            if os.getpgid(proc.pid) == proc.pid != os.getpgrp():
+                os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    for f in (proc.stdin, proc.stdout):
+        try:
+            if f is not None:
+                f.close()
+        except Exception:
+            pass
+    if proc.returncode is None:
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+
+def _talk(proc, payload, deadline):
+    """Write `payload` to the command's stdin and read its stdout, both without blocking (a command that writes before it reads, or
+    never reads, cannot hold the hook), until stdout ends. Returns ("ok", bytes), ("timeout", None) at the deadline or ("toolong",
+    None) as soon as more than MAX_OUTPUT bytes have been read; nothing past the cap is ever collected. The caller ends the group."""
+    out = bytearray()
+    sel = selectors.DefaultSelector()
+    try:
+        rfd, wfd = proc.stdout.fileno(), proc.stdin.fileno()
+        os.set_blocking(rfd, False)
+        os.set_blocking(wfd, False)
+        sel.register(rfd, selectors.EVENT_READ)
+        sel.register(wfd, selectors.EVENT_WRITE)
+        view, sent, reading = memoryview(payload), 0, True
+        while reading:
+            left = deadline - time.time()
+            if left <= 0:
+                return "timeout", None
+            for key, _ in sel.select(left):
+                if key.fd == rfd:
+                    try:
+                        chunk = os.read(rfd, 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        sel.unregister(rfd)
+                        reading = False
+                        continue
+                    out += chunk
+                    if len(out) > MAX_OUTPUT:
+                        return "toolong", None
+                else:
+                    try:
+                        sent += os.write(wfd, view[sent:sent + 65536])
+                    except BlockingIOError:
+                        pass
+                    except OSError:                       # the command closed its stdin: nothing more to send
+                        sent = len(view)
+                    if sent >= len(view):
+                        sel.unregister(wfd)
+                        proc.stdin.close()
+        return "ok", bytes(out)
+    finally:
+        sel.close()
+
+
+def _cmd_note(why):
+    _config.note("gbrain-redirect-guard", f"the lookup command {why}; the call goes on without a lookup")
+
+
+def lookup_command(pairs, deadline, banner, argv):
+    """{slug: info} from the command of gbrain_lookup_command (the contract is in the module docstring); {} (nothing known, every
+    call goes on, one short note on stderr) when the command is missing, fails, runs out of time, prints too much or does not print
+    the end line of this run. A note never carries the command's output, a slug or a variable."""
+    if not argv or not argv[0]:
+        return {}                                     # the setting itself was noted
+    if deadline - time.time() < 0.1:
+        _cmd_note("had no time left to run")
+        return {}
+    sentinel = "lookup-complete-" + uuid.uuid4().hex
+    payload = json.dumps({"sql": lookup_sql(sentinel), "variables": {"rows": lookup_rows(pairs), "banner": banner}}).encode("utf-8")
+    proc = None
+    try:
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=clean_env(),
+                                    cwd=os.path.expanduser("~"), start_new_session=True, bufsize=0)
+        except OSError:
+            _cmd_note("was not found, is not executable or could not be started")
+            return {}
+        status, raw = _talk(proc, payload, deadline)
+        if status == "ok":
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+    except Exception:                                 # a broken pipe, an unreadable pipe
+        _cmd_note("failed while it was being read")
+        return {}
+    finally:                                          # also when the hook's own timer ends it (SystemExit)
+        if proc is not None:
+            _end_group(proc)
+    if status == "timeout":
+        _cmd_note("ran out of time (GBRAIN_REDIRECT_BUDGET); use a persistent ssh connection or raise it")
+        return {}
+    if status == "toolong":
+        _cmd_note(f"printed more than {MAX_OUTPUT} bytes")
+        return {}
+    if proc.returncode != 0:
+        _cmd_note(f"exited with status {proc.returncode}")
+        return {}
+    lines = [ln for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+    if not lines or lines[-1] != sentinel:
+        _cmd_note("printed no end line for this run (it did not run the script, or its output was cut)")
+        return {}
+    rows = lines[:-1]
+    # One short row makes the whole answer unusable, on purpose: skipping it would leave its slug as not-there, and the new-page
+    # check would then refuse a page that exists.
+    if any(len(ln.split("\t")) < 3 for ln in rows):
+        _cmd_note("printed a row with fewer than three columns")
+        return {}
+    return parse_rows(pairs, rows)
 
 
 def lookup_cli(pairs, deadline, banner_re):
@@ -268,6 +469,9 @@ def lookup_cli(pairs, deadline, banner_re):
 
 def lookup(pairs, banner_re, banner):
     deadline = time.time() + BUDGET
+    argv = lookup_command_argv()
+    if argv is not None:                              # a command of its own: never the local psql or CLI
+        return lookup_command(pairs, deadline, banner, argv)
     found = lookup_psql(pairs, deadline, banner)
     if found is None:
         found = lookup_cli(pairs, deadline, banner_re)
