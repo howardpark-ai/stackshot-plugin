@@ -635,6 +635,12 @@ class Narrowing(Base):
         self.distrusted([f'echo {EVIL}; gh pr create -R 2>/dev/null -t "--w""eb"', f'echo {EVIL}; gh pr create -R < in.txt -t "--web"',
                          f'echo {EVIL}; gh pr create -R 2>&1 -t "--web"', f'echo {EVIL}; gh pr create -B 2>>err.log -R "--web"'])
 
+    def test_a_short_flag_cluster_that_swallows_its_value_is_untrusted_end_to_end(self):
+        # the hook itself, not only the scanner: the last stdout line is a link, yet the create may have been `--web` or `--help`
+        self.distrusted([f"echo {EVIL}; gh pr create {w}" for w in ("-wt1", "-wb1", "-wt-x", "-wR1", "-dwt1", "-fwt1", "-ewt1", "-hb1", "-hl1", "-wH.")])
+        self.distrusted([f"echo {EVIL}; gh pr create--web --title t", f"echo {EVIL}; gh pr\xa0create --title t", f"echo {EVIL}; gh pr create\r --title t",
+                         f"echo {EVIL}; gh pr create --fill >/dev/null"])
+
     def test_an_expansion_in_the_value_of_a_flag_that_takes_one_is_trusted(self):
         # the value of --title and the like can never become a flag of its own; `$( )` and backticks only inside double quotes
         body = "gh pr create --title \"x $Y\" --body \"$(cat <<'EOF'\nthe body, with --web and $HOME in it\nEOF\n)\""
@@ -685,19 +691,20 @@ GH_STUB = 'gh(){ printf "%s\\0" "$@" > "$ARGV_FILE"; }\n'            # never a r
 ARGV_VALUE_FLAGS = frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H", "--label", "-l",
                               "--assignee", "-a"))
 ARGV_ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=|-[tbFRBHla].")
-TOKENS = [" ", "<", ">", "(", ")", ";", "~", "$", "@", "*", '"', "'", "\\", "`", "-", "w", "e", "b", "case"]
+TOKENS = [" ", "<", ">", "(", ")", ";", "~", "$", "@", "*", '"', "'", "\\", "`", "-", "w", "e", "b", "case",
+          "1", ".", "/", "t", "h"]                      # digits and punctuation after a flag letter: gh lets a value flag swallow the rest of its word
 DIFF_PREFIX = ["", "cd d && ", "git push && ", "echo U; ", "W=--web; ", "W=-w; HOME=--web; ", "export HOME=-w; ", "HOME=--dry-run; ", "A=1 ", "cd d && git push && ",
                'W="--web x"; X=; echo U; ', "true;\n", "echo a | cat; "]
 DIFF_GOOD = ["--fill", "--title t", '--title "x $Y"', "--title 'a b'", "--body b", '--body "$(cat <<\'EOF\'\nthe body --web\nEOF\n)"', "--body-file - <<'EOF'\nbody\nEOF",
              "2>&1", "2>/dev/null", "-R x/y", "-B main", "-H feat", "-l bug", "-a me", "-d", "-t t", '-F "$F"', '--repo="$R"', '--title="a $B"', "--draft",
-             "# a comment"]
+             "# a comment", "-t1", "-b1", "-dt1", "-fb.x", "-R1", "-l1_2"]
 DIFF_BAD = ["--web<f", "-w<f", "--dry-run<<<x", "--help<&-", "--web<<EOF\nx\nEOF", "--title t --web</dev/null", "~", "~/x", '"$@"', '-t "$@" -b "$W"',
             '-l "$@" -a "$W"', "--title \"$(case a in a) echo '\"' ;; esac)\" --web #'", "$W", '"$W"', "{--web,}", "--web$X", "$(printf -- --web)",
             "`echo --web`", "-$(echo w)", '"--web"', "--we\\b", "-w", "--web", "*", "?", "[w]", "$HOME", '"$HOME"', '-t"$W"', "--title $W", "> f", "< f", ">&2",
             "2>$F", "<<EOF\nx\nEOF", "<<'EOF'\nx\nEOF", "--fill -w", "--fill\t--web", "--fill \\\n--web", "-t -w", '-R "$W" -w', "--title=--web", "!", "a}b",
-            "a]b", '"a b" \'c\'']
+            "a]b", '"a b" \'c\'', "-wt1", "-wb1", "-wt-x", "-wR1", "-dwt1", "-fwt1", "-ewt1", "-hb1", "-hl1", "-wH.", "-w1", "-h.", "-dh/x", "-wt_1"]
 DIFF_RAW = ["gh pr create", "--web", "-w", "$W", '"$W"', "<", ">", "~", "$@", "case", "$(", ")", "(", "`", ";", "'", '"', "\\", " ", "\t", "\n", "-t", "-b",
-            "x", "--", "-"]
+            "x", "--", "-", "-wt1", "-hb1", "-dwt1", "-wH.", "1", ".", "/", "_", "-t1", "-d"]
 _DIFF_MODULE = None                                                   # set before the worker processes are forked
 
 
@@ -713,7 +720,7 @@ def argv_has_quiet_flag(argv):
             continue
         elif x in ("--web", "-w", "--dry-run", "--help", "-h") or x.startswith(("--web=", "--dry-run=", "--help=")):
             return True
-        elif re.fullmatch(r"-[A-Za-z]+", x) and ("w" in x or "h" in x):
+        elif re.match(r"-[A-Za-z]*[wh]", x):               # a w or an h among the leading letters of a one-dash word: what follows may be a value's tail
             return True
     return False
 
@@ -944,6 +951,57 @@ class Whitelist(unittest.TestCase):
                                  "gh pr create --web=1", "gh pr create '--web=a\nb'", "gh pr create '--dry-run=a\nb'", "gh pr create '--help=\n'",
                                  "gh pr create --web=", "gh pr create --dry-run", "gh pr create --help"])
         self.assertAllTrusted(["gh pr create -d", "gh pr create -dD", "gh pr create -x", "gh pr create --draft", "gh pr create --website", "gh pr create --fill --webs"])
+
+    QUIET_CLUSTERS = ("-wt1", "-wb1", "-wt-x", "-wR1", "-dwt1", "-fwt1", "-ewt1", "-hb1", "-hl1", "-wH.", "-w1", "-w.", "-w/x", "-w_", "-h1", "-wt1.2", "-dh/x",
+                      "-fh_x", "-wb-1", '-w"t"1', "-\\wt1", "-w't'1")
+
+    def test_a_short_flag_cluster_with_a_value_tail_still_holds_its_quiet_flag(self):
+        # gh lets a flag that takes a value swallow the rest of its word, so `-wt1` is `--web` and `-t 1`: a w or an h among the leading letters of a
+        # one-dash word is quiet whatever follows the letters (a digit, `-`, `.`, `/`, `_`)
+        for verb in ("pr", "issue"):
+            self.assertAllUntrusted([f"gh {verb} create {w}" for w in self.QUIET_CLUSTERS])
+            self.assertAllUntrusted([f"gh {verb} create --title t {w} --body b" for w in self.QUIET_CLUSTERS])
+            self.assertAllUntrusted([f"echo U; gh {verb} create --fill {w}" for w in self.QUIET_CLUSTERS])
+        self.assertAllUntrusted(["gh pr create -t x -wt1", "gh pr create -d -hb1", "gh pr create -R x/y -wH."])
+
+    def test_a_value_tail_that_holds_no_quiet_flag_stays_trusted(self):
+        # the letters before the value's first character hold no w and no h: `-t1`, `-b.x` and `-dt1` are a title, a body and a draft with a title
+        self.assertAllTrusted(["gh pr create -t1", "gh pr create -b1", "gh pr create -dt1", "gh pr create -fb.x", "gh pr create -R1", "gh pr create -l1_2",
+                               "gh pr create -t1w", "gh pr create -t/h", "gh pr create -b-w", "gh pr create -t.h"])
+
+    def test_the_boring_controls_stay_trusted(self):
+        for verb in ("pr", "issue"):
+            self.assertAllTrusted([f"gh {verb} create --title t --body b", f"gh {verb} create -t title -b body", f"gh {verb} create --fill"])
+        self.assertAllTrusted(["gh pr create -d", "gh pr create --fill", "gh pr create --title t --body b", "gh pr create -t title -b body"])
+
+    def test_create_is_matched_as_a_whole_word_between_plain_blanks(self):
+        # `\b` after `create` and `\s` between the words let `create--web`, an NBSP, a CR or a form feed through; bash sees one word for each of them
+        self.assertAllUntrusted(["gh pr create--web --title t", "gh pr create--title t", "gh pr new--web", "gh pr create-x --fill", "gh pr create.x --fill",
+                                 "gh pr\xa0create --title t", "gh\xa0pr create --title t", "gh pr\u2003create --title t", "gh pr create\r --title t",
+                                 "gh pr create\r", "gh pr create\x0c--title t", "gh pr\rcreate --fill", "gh pr\x0bcreate --fill", "gh pr create\xa0--title t",
+                                 "cd\xa0d && gh pr create --fill", "cd\rd && gh pr create --fill", "A=x\xa0y gh pr create --fill", "echo\xa0x; gh pr create --fill"])
+        self.assertAllTrusted(["gh pr create", "gh pr new", "gh issue create", "gh pr create ", "gh pr create\t--fill", "gh pr create\n", "gh  pr   create  --fill",
+                               "gh\tpr\tcreate", "cd d && gh pr create --fill", "A=1\tgh pr create --fill"])
+
+    def test_the_segment_pattern_alone_takes_only_space_and_tab_between_its_words(self):
+        # words_are_literal also refuses these, so the pattern is pinned on its own (it is the second line of defence)
+        for text, expected in (("gh pr create --fill", True), ("gh pr new", True), ("gh pr create", True), ("A=1\tgh pr create", True), ("gh -R x pr create", True),
+                               ("gh -R x\tpr create", True), ("gh\xa0pr create", False), ("gh pr\xa0create", False), ("gh pr create\xa0x", False),
+                               ("gh pr create\rx", False), ("gh pr create\x0cx", False), ("gh pr create-x", False), ("gh pr createx", False),
+                               ("A=x\xa0gh pr create", False), ("gh -R\xa0x pr create", False), ("gh -R x\xa0pr create", False), ("gh\x0bpr create", False)):
+            with self.subTest(text=text):
+                self.assertEqual(self.m.CREATE_SEGMENT.match(text) is not None, expected)
+
+    def test_a_no_break_space_or_a_carriage_return_does_not_split_a_command_word_before_the_create(self):
+        # `A=x<NBSP>rm y` is one assignment word for bash; split on any whitespace it would read as `A=x`, then `rm`... hidden from the allowlist
+        self.assertAllUntrusted(["A=x\xa0rm y; gh pr create --fill", "A=x\xa0cd d; gh pr create --fill", "A=x\rcd d; gh pr create --fill",
+                                 "echo\xa0x; gh pr create --fill", "cd\x0cd; gh pr create --fill", "git\xa0push && gh pr create --fill"])
+        self.assertAllTrusted(["A=x cd d; gh pr create --fill", "A=x\tcd d; gh pr create --fill", "cd d && git\tpush && gh pr create --fill"])
+
+    def test_a_redirect_of_the_creates_output_is_untrusted_even_to_dev_null(self):
+        self.assertAllUntrusted(["gh pr create --fill >/dev/null", "gh pr create --fill > /dev/null", "gh pr create --fill 1>/dev/null", "gh pr create --fill >>/dev/null",
+                                 "gh issue create --fill >/dev/null"])
+        self.assertAllTrusted(["gh pr create --fill 2>/dev/null"])
 
     def test_only_the_cat_heredoc_is_a_substitution_a_value_may_hold(self):
         body = "gh pr create --title t --body \"$(%s)\""
