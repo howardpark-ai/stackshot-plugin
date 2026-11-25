@@ -41,6 +41,10 @@ prints hookSpecificOutput.additionalContext and exits 0. Two legs:
    bodies, `2>&1` and backslash continuations allowed), with no `--web`, `-w`, `--dry-run` or help flag (read after quotes and escapes
    are removed, so `"--web"` and `--we\b` count; a word of one dash whose leading letters hold a `w` or an `h` counts too, whatever follows
    them: `-wt1`, `-hb1` and `-dwt1` are all read as quiet, because gh lets a value flag swallow the rest of its word), and
+   every flag word is one of `gh pr create`'s or `gh issue create`'s own flags (the table GH_FLAGS, a test checks it against `gh --help`),
+   and a flag that takes a value takes the NEXT word as gh does (a long one without `=`, or a one-dash cluster whose last letter is a value
+   letter, as in `-m -t "-w"` or `-dt -b "-w"`: the quoted `-w` is then a flag of its own); a flag word that is not in the table makes the
+   command untrusted, and
    the LAST non-empty line of STDOUT is exactly the URL. The create's own words are a small whitelist (`words_are_literal`): outside
    single quotes a word holds only plain characters, escapes and quoted parts, and none of `< > ( ) ; & | ~ * ? [ ] { } !`, a backtick,
    `$@`, `$*` or a NUL stands there (the word `case` is refused only inside `$(...)` or backticks, see below). The only redirections are the whole words `2>&1`, `2>/dev/null` and a `<<'WORD'` opener. An expansion
@@ -172,6 +176,48 @@ FORBIDDEN = frozenset("<>~[]{}!")                    # plain characters that may
 REDIRECT_WORDS = frozenset(("2>&1", "2>/dev/null"))   # the redirections of the create that are whole words of their own
 HEREDOC_WORD = re.compile(r"<<'[A-Za-z_]\w*'")
 ASSIGN_HEAD = re.compile(r"[A-Za-z_]\w*=")
+# Every flag of `gh pr create` and `gh issue create`, as `gh <verb> create --help` lists them (inherited ones included), so that the scanner knows
+# which flag takes the NEXT word and which do not: pflag gives a value flag the next word whatever it looks like (`-m -t "-w"` is a milestone
+# named `-t` and then a quiet `-w`), and a one-dash cluster takes it when its LAST letter is a value letter and nothing follows that letter
+# (`-dt -b "-w"`: draft, a title of `-b`, then `-w`). A flag word that is not in the table is untrusted (a whitelist, not a blacklist), and a
+# test fails when the installed gh lists a flag this table lacks. The quiet flags (`--web`, `--dry-run`, `--help`, `-w`, `-h`) are left out:
+# QUIET_WORD refuses them first.
+GH_FLAGS = {
+    "pr": {"value_long": frozenset(("assignee", "attach", "base", "body", "body-file", "head", "label", "milestone", "project", "recover", "reviewer",
+                                    "template", "title", "repo")),
+           "bool_long": frozenset(("draft", "editor", "fill", "fill-first", "fill-verbose", "no-maintainer-edit")),
+           "value_short": frozenset("aBbFHlmprTtR"), "bool_short": frozenset("def")},
+    "issue": {"value_long": frozenset(("assignee", "attach", "blocked-by", "blocking", "body", "body-file", "label", "milestone", "parent", "project",
+                                       "recover", "template", "title", "type", "repo")),
+              "bool_long": frozenset(("editor",)),
+              "value_short": frozenset("abFlmpTtR"), "bool_short": frozenset("e")},
+}
+
+
+def flag_value_need(v, grp):
+    """What the flag word `v` (quotes and escapes removed) asks of the words after it: None when it is not a flag of the create the table
+    knows (untrusted), "" when it takes no further word, "x" when it takes the NEXT word and that value may hold an expansion (one of
+    VALUE_FLAGS), "p" when it takes the next word and the value must be plain."""
+    tbl = GH_FLAGS[grp]
+    if v.startswith("--"):
+        name, eq, _rest = v[2:].partition("=")
+        if name in tbl["value_long"]:
+            return "" if eq else ("x" if "--" + name in VALUE_FLAGS else "p")
+        return "" if name in tbl["bool_long"] and not eq else None
+    cluster = v[1:]
+    if not cluster:
+        return None                                   # a lone `-`
+    for i, ch in enumerate(cluster):
+        if ch in tbl["bool_short"]:
+            continue
+        if ch in tbl["value_short"]:
+            if i < len(cluster) - 1:
+                return ""                             # the rest of the word is the value
+            return "x" if "-" + ch in VALUE_FLAGS else "p"
+        return None                                   # a letter gh does not know (or a non-letter before any value letter)
+    return ""
+
+
 ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=")      # `-t"$T"` is not here: an empty `$T` leaves `-t` to take the next word
 STDOUT_OP = re.compile(r">>|>\||>&|>")
 BRACE_VAR = re.compile(r"\$\{\w+\}")
@@ -416,14 +462,16 @@ def dq_ok(chunk, value):
     return value or "$" not in inner
 
 
-def words_are_literal(chunks):
+def words_are_literal(chunks, grp="pr"):
     """Whether the words of the create command (the chunks of its segment) are boring enough to be read exactly: nothing in them that
     the shell expands, splits or redirects, and no `--web`, `-w`, `--dry-run` or help flag after quotes and escapes are removed.
     Outside single quotes a word holds only plain characters (not `< > ~ [ ] { } !`), escapes and quoted parts; an expansion (`$name`, `${…}`,
     `$(…)`, a backtick, a brace list, a glob character) is untrusted wherever it stands except inside DOUBLE quotes in the value of a
     flag that takes one (VALUE_FLAGS: the next word, or the rest of a `--title=…` word): there `$name` and `${name}` may stand, and a
     `$(cat <<'WORD' … WORD)` substitution as the whole of the value. Words before `gh` are `NAME=value` words. The only redirections
-    are the whole words `2>&1`, `2>/dev/null` and a `<<'WORD'` opener, none of which is an argument."""
+    are the whole words `2>&1`, `2>/dev/null` and a `<<'WORD'` opener, none of which is an argument. Every flag word must be one of
+    `gh <grp> create`'s own (GH_FLAGS) and a flag that takes a value takes the next word, as pflag does; an expansion may stand only in the value
+    of one of VALUE_FLAGS."""
     words, cur = [], []
     for chunk in chunks:
         if chunk[1] == "sep":
@@ -455,17 +503,19 @@ def words_are_literal(chunks):
             return False                              # not a `NAME=value` word
     else:
         return False
-    value_next = False
+    value_next = ""                                   # "" no value awaited; "x" the next word is a value that may hold an expansion; "p" a plain one
     for w in words[k + 1:]:
         text = "".join(c for c, _k in w)
         if text in REDIRECT_WORDS or HEREDOC_WORD.fullmatch(text):
             continue                                  # a redirection is no argument, and leaves a flag still waiting for its value
         if value_next:
-            value_next = False
-            if not parts_ok(w, True) or (all(kd in ("lit", "esc") for _c, kd in w) and QUIET_WORD.fullmatch(word_value(w))):
+            expand = value_next == "x"
+            value_next = ""
+            if not parts_ok(w, expand) or (all(kd in ("lit", "esc") for _c, kd in w) and QUIET_WORD.fullmatch(word_value(w))):
                 return False
             continue
-        if ATTACHED.match(text):
+        a = ATTACHED.match(text)
+        if a and text[2:a.end() - 1] in GH_FLAGS[grp]["value_long"]:
             if not parts_ok(w, True):
                 return False
             continue
@@ -474,7 +524,11 @@ def words_are_literal(chunks):
         v = word_value(w)
         if QUIET_WORD.fullmatch(v):
             return False
-        value_next = v in VALUE_FLAGS
+        if v.startswith("-"):
+            need = flag_value_need(v, grp)
+            if need is None:
+                return False
+            value_next = need
     return not value_next
 
 
@@ -488,7 +542,7 @@ def trusted_create(cmd):
         return None
     _sep, _text, blank, chunks = segs[-1]
     m = CREATE_SEGMENT.match(blank)                   # on the text with its quoted parts blanked: `A="x gh pr create"` runs no create (m is None then)
-    if not words_are_literal(chunks):
+    if m is None or not words_are_literal(chunks, m.group("grp")):
         return None
     for _s, _t, b, _c in segs[:-1]:
         words = [w for w in ASSIGNS.sub("", b, count=1).split(" ") if w]

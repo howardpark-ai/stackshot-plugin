@@ -15,6 +15,7 @@ import multiprocessing
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -688,11 +689,14 @@ class Narrowing(Base):
 
 # ---- the bash differential: a command the scanner trusts, run by bash with `gh` a function that only prints its argv -------------------
 GH_STUB = 'gh(){ printf "%s\\0" "$@" > "$ARGV_FILE"; }\n'            # never a real gh: it writes its argv, NUL-separated, to a file
-ARGV_VALUE_FLAGS = frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H", "--label", "-l",
-                              "--assignee", "-a"))
-ARGV_ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=|-[tbFRBHla].")
+# gh's value flags as pflag reads them, for `gh pr create` and `gh issue create` together (the help lists them; written out here on purpose, apart
+# from the hook's own table, so that the oracle is not the code under test): a long one takes the next word unless it has `=`, a short one takes
+# the rest of its word, or the next word when it ends the word
+ARGV_VALUE_LONG = frozenset(("assignee", "attach", "base", "blocked-by", "blocking", "body", "body-file", "head", "label", "milestone", "parent", "project",
+                             "recover", "reviewer", "template", "title", "type", "repo"))
+ARGV_VALUE_SHORT = frozenset("aBbFHlmprTtR")
 TOKENS = [" ", "<", ">", "(", ")", ";", "~", "$", "@", "*", '"', "'", "\\", "`", "-", "w", "e", "b", "case",
-          "1", ".", "/", "t", "h"]                      # digits and punctuation after a flag letter: gh lets a value flag swallow the rest of its word
+          "1", ".", "/", "t", "h", "d", "m", "r"]            # digits and punctuation after a flag letter: gh lets a value flag swallow the rest of its word
 DIFF_PREFIX = ["", "cd d && ", "git push && ", "echo U; ", "W=--web; ", "W=-w; HOME=--web; ", "export HOME=-w; ", "HOME=--dry-run; ", "A=1 ", "cd d && git push && ",
                'W="--web x"; X=; echo U; ', "true;\n", "echo a | cat; "]
 DIFF_GOOD = ["--fill", "--title t", '--title "x $Y"', "--title 'a b'", "--body b", '--body "$(cat <<\'EOF\'\nthe body --web\nEOF\n)"', "--body-file - <<'EOF'\nbody\nEOF",
@@ -705,23 +709,36 @@ DIFF_BAD = ["--web<f", "-w<f", "--dry-run<<<x", "--help<&-", "--web<<EOF\nx\nEOF
             "a]b", '"a b" \'c\'', "-wt1", "-wb1", "-wt-x", "-wR1", "-dwt1", "-fwt1", "-ewt1", "-hb1", "-hl1", "-wH.", "-w1", "-h.", "-dh/x", "-wt_1"]
 DIFF_RAW = ["gh pr create", "--web", "-w", "$W", '"$W"', "<", ">", "~", "$@", "case", "$(", ")", "(", "`", ";", "'", '"', "\\", " ", "\t", "\n", "-t", "-b",
             "x", "--", "-", "-wt1", "-hb1", "-dwt1", "-wH.", "1", ".", "/", "_", "-t1", "-d"]
+DIFF_VALUE_FLAGS = ["-m", "-p", "-r", "-T", "-a", "-l", "-R", "-B", "-H", "-F", "-t", "-b", "-dt", "-ft", "-dR", "-dH", "-dm", "-fb", "-ep", "-dr", "-fT",
+                    "--milestone", "--project", "--reviewer", "--template", "--recover", "--attach", "--blocked-by", "--blocking", "--parent", "--type",
+                    "--title", "--body", "--body-file", "--repo", "--base", "--head", "--label", "--assignee"]
+DIFF_QUOTED_QUIET = ['"-w"', "'-w'", '"--web"', "'--help'", '"-h"', '"$W"', "'-t'", "'-b'", "-hlm.w''", "'--dry-run'", '"-dw"', '"$W$X"', "-w", "--web"]
+DIFF_POOL = DIFF_GOOD + DIFF_BAD + DIFF_VALUE_FLAGS + DIFF_VALUE_FLAGS + DIFF_QUOTED_QUIET + DIFF_QUOTED_QUIET
 _DIFF_MODULE = None                                                   # set before the worker processes are forked
 
 
 def argv_has_quiet_flag(argv):
-    """Whether the words gh would be given hold a flag that stops it printing the link (a value flag's next word is a value, whatever it is)."""
-    skip = False
+    """Whether the words gh would be given hold a flag that stops it printing the link, read the way pflag reads them: a value flag takes the next
+    word whatever it looks like, a cluster of short flags is read letter by letter until a value letter takes the rest of the word (or the next
+    word), and `--` ends the flags."""
+    pending = False
     for x in argv:
-        if skip:
-            skip = False
-        elif x in ARGV_VALUE_FLAGS:
-            skip = True
-        elif ARGV_ATTACHED.match(x):
-            continue
-        elif x in ("--web", "-w", "--dry-run", "--help", "-h") or x.startswith(("--web=", "--dry-run=", "--help=")):
-            return True
-        elif re.match(r"-[A-Za-z]*[wh]", x):               # a w or an h among the leading letters of a one-dash word: what follows may be a value's tail
-            return True
+        if pending:
+            pending = False
+        elif x == "--":
+            return False
+        elif x.startswith("--"):
+            name, eq, _rest = x[2:].partition("=")
+            if name in ("web", "dry-run", "help"):
+                return True
+            pending = name in ARGV_VALUE_LONG and not eq
+        elif x.startswith("-") and len(x) > 1:
+            for k, ch in enumerate(x[1:]):
+                if ch in "wh":
+                    return True
+                if ch in ARGV_VALUE_SHORT:
+                    pending = k == len(x) - 2
+                    break
     return False
 
 
@@ -775,13 +792,17 @@ def diff_one(cmd, d, tally, hits):
 
 def diff_random_command(rng):
     kind = rng.random()
-    if kind < 0.45:
+    create = "gh " + rng.choice(["pr", "pr", "pr", "issue"]) + " create"
+    if kind < 0.4:
         sep = rng.choice([" ", " ", "\t", " \\\n "])
-        return rng.choice(DIFF_PREFIX) + "gh pr create" + sep + sep.join(rng.choice(DIFF_GOOD + DIFF_BAD) for _ in range(rng.randint(0, 4)))
-    if kind < 0.7:
-        return rng.choice(DIFF_PREFIX) + "gh pr create " + "".join(rng.choice(DIFF_RAW) for _ in range(rng.randint(1, 6)))
+        return rng.choice(DIFF_PREFIX) + create + sep + sep.join(rng.choice(DIFF_POOL) for _ in range(rng.randint(0, 5)))
+    if kind < 0.55:
+        return rng.choice(DIFF_PREFIX) + create + " " + "".join(rng.choice(DIFF_RAW) for _ in range(rng.randint(1, 6)))
+    if kind < 0.8:                                # a value flag, then the word that a real gh gives it, then more flags
+        words = [rng.choice(DIFF_VALUE_FLAGS), rng.choice(DIFF_QUOTED_QUIET + DIFF_GOOD), rng.choice(DIFF_POOL), rng.choice(DIFF_POOL)]
+        return rng.choice(DIFF_PREFIX) + create + " " + " ".join(words[:rng.randint(2, 4)])
     words = " ".join(rng.choice(DIFF_GOOD + DIFF_BAD[:12]) for _ in range(rng.randint(1, 3)))
-    return rng.choice(DIFF_PREFIX) + "gh pr create " + words + rng.choice(["", " --fill", " # c"])
+    return rng.choice(DIFF_PREFIX) + create + " " + words + rng.choice(["", " --fill", " # c"])
 
 
 def diff_random_chunk(args):
@@ -950,7 +971,9 @@ class Whitelist(unittest.TestCase):
                                  "gh pr create -hd", "gh pr create -xhx", "gh pr create -Zw", "gh pr create -wZ",
                                  "gh pr create --web=1", "gh pr create '--web=a\nb'", "gh pr create '--dry-run=a\nb'", "gh pr create '--help=\n'",
                                  "gh pr create --web=", "gh pr create --dry-run", "gh pr create --help"])
-        self.assertAllTrusted(["gh pr create -d", "gh pr create -dD", "gh pr create -x", "gh pr create --draft", "gh pr create --website", "gh pr create --fill --webs"])
+        self.assertAllTrusted(["gh pr create -d", "gh pr create -df", "gh pr create --draft", "gh pr create --fill --draft"])
+        # a flag that gh does not have is untrusted (the scanner knows gh's own flags and nothing else), `--website` and `--webs` among them
+        self.assertAllUntrusted(["gh pr create -dD", "gh pr create -x", "gh pr create --website", "gh pr create --fill --webs", "gh issue create -d", "gh issue create --fill"])
 
     QUIET_CLUSTERS = ("-wt1", "-wb1", "-wt-x", "-wR1", "-dwt1", "-fwt1", "-ewt1", "-hb1", "-hl1", "-wH.", "-w1", "-w.", "-w/x", "-w_", "-h1", "-wt1.2", "-dh/x",
                       "-fh_x", "-wb-1", '-w"t"1', "-\\wt1", "-w't'1")
@@ -971,8 +994,8 @@ class Whitelist(unittest.TestCase):
 
     def test_the_boring_controls_stay_trusted(self):
         for verb in ("pr", "issue"):
-            self.assertAllTrusted([f"gh {verb} create --title t --body b", f"gh {verb} create -t title -b body", f"gh {verb} create --fill"])
-        self.assertAllTrusted(["gh pr create -d", "gh pr create --fill", "gh pr create --title t --body b", "gh pr create -t title -b body"])
+            self.assertAllTrusted([f"gh {verb} create --title t --body b", f"gh {verb} create -t title -b body"])
+        self.assertAllTrusted(["gh pr create -d", "gh pr create --fill", "gh pr create --title t --body b", "gh pr create -t title -b body", "gh pr create -d --fill"])
 
     def test_create_is_matched_as_a_whole_word_between_plain_blanks(self):
         # `\b` after `create` and `\s` between the words let `create--web`, an NBSP, a CR or a form feed through; bash sees one word for each of them
@@ -997,6 +1020,162 @@ class Whitelist(unittest.TestCase):
         self.assertAllUntrusted(["A=x\xa0rm y; gh pr create --fill", "A=x\xa0cd d; gh pr create --fill", "A=x\rcd d; gh pr create --fill",
                                  "echo\xa0x; gh pr create --fill", "cd\x0cd; gh pr create --fill", "git\xa0push && gh pr create --fill"])
         self.assertAllTrusted(["A=x cd d; gh pr create --fill", "A=x\tcd d; gh pr create --fill", "cd d && git\tpush && gh pr create --fill"])
+
+    VALUE_FLAG_REPRODUCTIONS = ('echo U; gh pr create -m -t "-w"', 'echo U; gh pr create -dt -b "-w"', 'W=--web; echo U; gh pr create -dt -b "$W"',
+                                'W=--web; echo U; gh pr create -ft -B "$W"', "echo U; gh pr create -r '-t' -hlm.w''", 'echo U; gh issue create --type -b "-w"')
+
+    def test_a_value_flag_the_scanner_did_not_know_still_takes_the_next_word(self):
+        # gh gives the next word to `-m`, `-p`, `-r`, `-T`, `--type` and the like, and to a cluster that ends in a value letter (`-dt`): a quoted
+        # quiet word after one of them is a flag of its own, and a plain one is a value the scanner has to keep out of a flag position
+        self.assertAllUntrusted(list(self.VALUE_FLAG_REPRODUCTIONS))
+        for cmd in self.VALUE_FLAG_REPRODUCTIONS:
+            with self.subTest(cmd=cmd):
+                argv = bash_argv(cmd)
+                self.assertTrue(argv_has_quiet_flag(argv), argv)               # real bash, a stand-in gh: the quiet flag does reach gh
+
+    def test_every_flag_of_a_create_takes_what_gh_gives_it(self):
+        for verb in ("pr", "issue"):
+            table = self.m.GH_FLAGS[verb]
+            keep = "--fill" if verb == "pr" else "--title t"
+            for name in sorted(table["value_long"]):
+                flag = "--" + name
+                with self.subTest(verb=verb, flag=flag):
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag} '-w' {keep}"))        # the next word is its value, even a quoted -w
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag} -x {keep}"))          # and a plain one that is no quiet flag
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag} x -w"))               # the word after the value is a flag again
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag} x '-w'"))
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag} -w"))                 # a plain quiet word is never trusted
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag}"))                    # a value that never comes
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag}=x {keep}"))
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag}=x '-w'"))
+                    self.assertEqual(self.trusted(f'gh {verb} create {flag} "$V" {keep}'), flag in self.m.VALUE_FLAGS)   # an expansion: only the old eight
+                    self.assertEqual(self.trusted(f'gh {verb} create {flag}="$V" {keep}'), flag in self.m.VALUE_FLAGS)
+            for name in sorted(table["bool_long"]):
+                flag = "--" + name
+                with self.subTest(verb=verb, flag=flag):
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag} --title t"))
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag} '-w'"))                # no value to swallow it
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag}=true --title t"))
+            for ch in sorted(table["value_short"]):
+                flag = "-" + ch
+                with self.subTest(verb=verb, flag=flag):
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag} '-w' {keep}"))
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag} x -w"))
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag}"))
+                    self.assertTrue(self.trusted(f"gh {verb} create {flag}x1 {keep}"))            # the rest of the word is the value
+                    self.assertFalse(self.trusted(f"gh {verb} create {flag}x1 '-w'"))
+                    self.assertEqual(self.trusted(f'gh {verb} create {flag} "$V" {keep}'), flag in self.m.VALUE_FLAGS)
+                    for lead in sorted(table["bool_short"]):                                       # a cluster that ends in the value letter
+                        cluster = f"-{lead}{ch}"
+                        self.assertTrue(self.trusted(f"gh {verb} create {cluster} '-w' {keep}"), cluster)
+                        self.assertFalse(self.trusted(f"gh {verb} create {cluster} x -w"), cluster)
+                        self.assertFalse(self.trusted(f"gh {verb} create {cluster}"), cluster)
+                        self.assertFalse(self.trusted(f'gh {verb} create {cluster} "-b" "$V"'), cluster)
+            for ch in sorted(table["bool_short"]):
+                with self.subTest(verb=verb, flag="-" + ch):
+                    self.assertFalse(self.trusted(f"gh {verb} create -{ch} '-w'"))
+
+    def test_a_flag_word_the_table_does_not_know_is_untrusted(self):
+        # a whitelist, not a blacklist: the flags of the other kind of create, a made-up one, `--`, a lone dash and a bool flag given a value
+        self.assertAllUntrusted(["gh pr create --type x", "gh pr create --parent 1", "gh pr create --blocking 1", "gh issue create --fill", "gh issue create -d",
+                                 "gh issue create --base main", "gh issue create -r x", "gh issue create -B main", "gh issue create -H x", "gh pr create --bogus",
+                                 "gh pr create --bogus x", "gh pr create --bogus=x", "gh pr create -x", "gh pr create -dx", "gh pr create --", "gh pr create -",
+                                 "gh pr create --fill=true", "gh pr create -d=true", "gh pr create -t x -k", "gh pr create -t x --", "gh pr create -t=x -9",
+                                 "gh pr create --title t --nope", "gh -x y pr create --fill", "gh --nope x pr create --fill"])
+        self.assertAllTrusted(["gh pr create --title t --fill", "gh -R x/y pr create --fill", "gh --repo x/y issue create --title t"])
+
+    def test_an_expansion_stands_only_in_the_value_of_the_original_eight_flags(self):
+        self.assertAllUntrusted(['gh pr create -m "$M" --fill', 'gh pr create --milestone "$M" --fill', 'gh pr create --milestone="$M" --fill',
+                                 'gh pr create -p "$P" --fill', 'gh pr create -r "$R" --fill', 'gh pr create -T "$T" --fill', 'gh pr create --reviewer "$R" --fill',
+                                 'gh pr create --template "$T" --fill', 'gh pr create --recover "$R" --fill', 'gh pr create --attach "$A" --fill',
+                                 'gh issue create --type "$T" --title t', 'gh issue create --parent "$P" --title t', 'gh issue create --blocked-by "$B" --title t',
+                                 'gh issue create --blocking "$B" --title t', 'gh pr create -dm "$M" --fill', 'gh pr create -fp "$P" --fill'])
+        self.assertAllTrusted(['gh pr create -a "$A" --fill', 'gh pr create -dt "$T" --fill', 'gh pr create -fB "$B" --fill', 'gh pr create -dH "$H" --fill',
+                               'gh pr create -fl "$L" --fill', 'gh pr create -R "$R" --fill', 'gh pr create -F "$F" --fill', 'gh issue create -a "$A" --title t'])
+
+    def test_the_table_is_the_set_of_flags_gh_2_103_lists(self):
+        # the flags written out by hand from `gh pr create --help` and `gh issue create --help` of gh 2.103 (the installed gh of a test machine may be older,
+        # and the loops above read the table itself), so that dropping or adding a flag in the hook's table fails here
+        expected = {"pr": {"value_long": {"assignee", "attach", "base", "body", "body-file", "head", "label", "milestone", "project", "recover", "reviewer",
+                                          "template", "title", "repo"},
+                           "bool_long": {"draft", "editor", "fill", "fill-first", "fill-verbose", "no-maintainer-edit"},
+                           "value_short": set("aBbFHlmprTtR"), "bool_short": set("def")},
+                    "issue": {"value_long": {"assignee", "attach", "blocked-by", "blocking", "body", "body-file", "label", "milestone", "parent", "project",
+                                             "recover", "template", "title", "type", "repo"},
+                              "bool_long": {"editor"}, "value_short": set("abFlmpTtR"), "bool_short": {"e"}}}
+        self.assertEqual({v: {k: set(x) for k, x in t.items()} for v, t in self.m.GH_FLAGS.items()}, expected)
+
+    def test_a_flag_of_the_other_create_with_an_equals_sign_is_untrusted(self):
+        self.assertAllUntrusted(["gh issue create --base=main --title t", "gh issue create --head=x --title t", "gh issue create --reviewer=x --title t",
+                                 "gh pr create --type=x --fill", "gh pr create --parent=1 --fill", "gh pr create --blocking=1 --fill"])
+
+    def test_a_cluster_with_a_w_or_an_h_before_a_value_letters_end_is_untrusted_even_where_gh_reads_a_value(self):
+        # conservative on purpose: `-tw` is a title `w` for gh, but the scanner cannot tell the rest of a word from a flag, so it never trusts one
+        self.assertAllUntrusted(["gh pr create -tw --fill", "gh pr create -bh --fill", "gh pr create -Rhub/x --fill", "gh pr create -dtw", "gh pr create -mh"])
+
+    def test_the_table_lists_every_flag_the_installed_gh_lists(self):
+        gh = shutil.which("gh")
+        if not gh:
+            self.skipTest("no gh on this machine")
+        quiet = {"web", "dry-run", "help", "w", "h"}
+        for verb in ("pr", "issue"):
+            r = subprocess.run([gh, verb, "create", "--help"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                               env={"PATH": os.environ["PATH"], "HOME": tempfile.gettempdir(), "NO_COLOR": "1", "GH_PROMPT_DISABLED": "1"})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            table = self.m.GH_FLAGS[verb]
+            seen = 0
+            for line in r.stdout.splitlines():
+                m = re.match(r"\s+(?:-(\w), )?--([\w-]+)(?: (\S+))?\s{2,}", line)
+                if not m:
+                    continue
+                short, name, arg = m.groups()
+                seen += 1
+                with self.subTest(verb=verb, flag=name):
+                    if name in quiet:
+                        continue
+                    if arg:
+                        self.assertIn(name, table["value_long"])
+                        if short:
+                            self.assertIn(short, table["value_short"])
+                    else:
+                        self.assertIn(name, table["bool_long"])
+                        if short and short not in quiet:
+                            self.assertIn(short, table["bool_short"])
+            self.assertGreater(seen, 8)
+
+    def test_a_real_gh_gives_the_next_word_to_every_value_flag_in_the_table(self):
+        # real gh, offline: an unknown flag is refused before anything else happens, so "unknown flag: --bogus" in stderr means that `--bogus`
+        # was read as a flag, and its absence that the flag before it took it as its value
+        gh = shutil.which("gh")
+        if not gh:
+            self.skipTest("no gh on this machine")
+        with tempfile.TemporaryDirectory(prefix="ptn-gh-") as d:
+            env = {"PATH": os.environ["PATH"], "HOME": d, "GH_CONFIG_DIR": d, "GH_TOKEN": "x", "HTTPS_PROXY": "http://127.0.0.1:9", "GH_PROMPT_DISABLED": "1",
+                   "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
+
+            def refused(*args):
+                r = subprocess.run([gh, *args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, cwd=d, env=env)
+                return "unknown flag: --bogus" in r.stderr, r.stderr
+
+            self.assertTrue(refused("pr", "create", "--bogus")[0])                 # the control: a flag position refuses it
+            for verb in ("pr", "issue"):
+                table = self.m.GH_FLAGS[verb]
+                for flag in ["--" + n for n in sorted(table["value_long"])] + ["-" + c for c in sorted(table["value_short"])]:
+                    _seen, err = refused(verb, "create", flag, "x")
+                    if "unknown flag" in err or "unknown shorthand" in err:
+                        continue                                                    # a flag this (older) gh does not have
+                    with self.subTest(verb=verb, flag=flag):
+                        self.assertFalse(refused(verb, "create", flag, "--bogus")[0])
+                for lead in sorted(table["bool_short"]):
+                    for ch in sorted(table["value_short"]):
+                        with self.subTest(verb=verb, cluster=lead + ch):
+                            self.assertFalse(refused(verb, "create", f"-{lead}{ch}", "--bogus")[0])
+                for flag in ["--" + n for n in sorted(table["bool_long"])] + ["-" + c for c in sorted(table["bool_short"])]:
+                    seen, err = refused(verb, "create", flag, "--bogus")
+                    if not seen and ("unknown flag" in err or "unknown shorthand" in err):
+                        continue                                                    # a flag this (older) gh does not have
+                    with self.subTest(verb=verb, flag=flag):
+                        self.assertTrue(seen)                                       # a bool flag takes nothing: `--bogus` is a flag again
 
     def test_a_redirect_of_the_creates_output_is_untrusted_even_to_dev_null(self):
         self.assertAllUntrusted(["gh pr create --fill >/dev/null", "gh pr create --fill > /dev/null", "gh pr create --fill 1>/dev/null", "gh pr create --fill >>/dev/null",
@@ -1172,8 +1351,8 @@ class Shapes(unittest.TestCase):
         self.assertIsNotNone(self.m.trusted_create('A="a b" gh -R "x y" pr create --title "t" --fill'))
 
     def test_the_words_of_a_create_are_read_as_bash_reads_them(self):
-        # a backslash inside double quotes stays in the word: `"--w\eb"` is not `--web`
-        for cmd in ('gh pr create "--w\\eb"', "gh pr create --title '--web'", 'gh pr create --title "a --web b"', "gh pr create --title=--web",
+        # a backslash inside double quotes stays in the word: `"--w\eb"` is not `--web` (and, a flag gh does not have, it is untrusted below)
+        for cmd in ("gh pr create --title '--web'", 'gh pr create --title "a --web b"', "gh pr create --title=--web",
                     "gh pr create --body-file - <<'EOF'\n--web\nEOF", "gh pr create -t '-w' -b \"-h\"", "gh pr create -B main -H feature --label bug", "gh pr create -R 2>&1 x/y --fill", "gh.exe pr create --fill", "A=1 gh.exe issue new --title 'a'",
                     "gh pr create --fill 2>/dev/null --title 'a'", 'gh pr create -t 2>/dev/null "--web"',
                     'gh pr create -B 2>&1 "$B" --fill',
@@ -1181,7 +1360,7 @@ class Shapes(unittest.TestCase):
                     'gh pr create --title "x $Y" --fill', 'gh pr create -t "$T" --body "$(cat <<\'EOF\'\nb\nEOF\n)"', "gh pr create --fill"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.m.trusted_create(cmd))
-        for cmd in ("gh pr create $W", 'gh pr create "$W"', "gh pr create {--web,}", "gh pr create --web$X", "gh pr create $(x)", "gh pr create `x`",
+        for cmd in ('gh pr create "--w\\eb"', "gh pr create $W", 'gh pr create "$W"', "gh pr create {--web,}", "gh pr create --web$X", "gh pr create $(x)", "gh pr create `x`",
                     "gh pr create -$(echo w)", "gh pr create *", 'gh pr create "--web"', "gh pr create --we\\b", "gh pr create --title", "gh pr create -R",
                     "gh pr create --fill --title $Y", "gh pr create --fill -d$X", "gh $G pr create --fill", "gh.exe pr create $W", "W=--web gh.exe pr create $W", 'gh pr create -t"$T" --fill',
                     'gh pr create -R 2>/dev/null -t "--web"', "gh pr create -R < in.txt -t '-w'"):
