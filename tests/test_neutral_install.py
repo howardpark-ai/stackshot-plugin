@@ -424,6 +424,29 @@ class PostToolNote(Neutral):
             failed = {"tool_name": "Bash", "tool_input": {"command": "gh pr create"}, "tool_response": {"stdout": "error"}}
             self.assertEqual(self.hook("post-tool-note.py", failed, env)[0], "")
 
+    def test_pane_capture_dim_text(self):
+        def ctx(home, cmd):
+            ev = {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {"stdout": "x"}}
+            out = self.hook("post-tool-note.py", ev, env_for(home))[0]
+            return context(out) if out else ""
+        with temp_home() as home:
+            for cmd in ("tmux capture-pane -p -t x", "tmux capturep -pt %3 | tail -5", "ssh box 'tmux capture-pane -p'",
+                        "tmux capture-pane -pe -t x; tmux capture-pane -p -t y", "tmux capture-pane -p -t x | grep -e foo"):
+                with self.subTest(cmd=cmd):
+                    c = ctx(home, cmd)
+                    self.assertIn("unknown origin", c)
+                    self.assertIn("dim suggested prompt", c)
+                    self.assertEqual(c.count("dim suggested prompt"), 1)
+            for cmd in ("tmux capture-pane -pe -t x", "tmux capture-pane -p -e -t x", "tmux capturep -ept %3",
+                        "ssh box 'tmux capture-pane -pe'", "tmux -L probe capture-pane -e -p -S -50 | tail -5"):
+                with self.subTest(cmd=cmd):
+                    c = ctx(home, cmd)
+                    self.assertIn("unknown origin", c)
+                    self.assertNotIn("dim suggested prompt", c)
+            for cmd in ("tmux list-sessions", "echo capture-pane", "tmux ls | grep capture-pane"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(ctx(home, cmd), "")
+
     def test_portal_create_without_stackshot(self):
         with temp_home() as home:
             env = env_for(home)
