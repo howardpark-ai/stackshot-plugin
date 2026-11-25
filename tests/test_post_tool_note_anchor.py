@@ -28,6 +28,7 @@ NOTE_TAG = "(post-tool-note.py)"
 OLDER = "Created {url}. Anchor it now: stackshot anchors(project=..., add=[{url}]) " + NOTE_TAG + "."
 NOT_FROM_CREATE = "the link did not come from the create call itself"
 OTHER_PR = "https://github.com/acme/widgets/pull/99"
+EVIL = "https://github.com/evil-org/evil-repo/pull/99"        # a link the create call never printed
 
 # The stand-in for stackshot's client.py: control files sit beside $PTN_OUT.
 FAKE_CLIENT = '''import json, os, sys, time
@@ -40,6 +41,8 @@ def ctl(name):
     return open(p).read() if os.path.exists(p) else None
 if args[:2] == ["get", "open-records"]:
     if ctl("sleep.get"):
+        with open(out + ".pid", "w") as f:
+            f.write(str(os.getpid()))
         time.sleep(float(ctl("sleep.get")))
     if ctl("get.rc") not in (None, "0"):
         print(ctl("get.out") or "[401] no token on this machine")
@@ -407,6 +410,55 @@ class Narrowing(Base):
         self.untrusted(bash_event("cat <<'EOF'\ngh pr create --fill\nEOF", PR + "\n"))
         self.untrusted(bash_event('echo "$(gh pr create --fill)"', PR + "\n", session="s2"))
 
+    def distrusted(self, commands, stdout=EVIL + "\n"):
+        """Each command ends its stdout in a link the create did not print: nothing is anchored, the older note says why."""
+        for n, command in enumerate(commands):
+            with self.subTest(command=command):
+                note = self.untrusted(bash_event(command, stdout, session=f"d{n}"))
+                self.assertTrue(note.startswith(OLDER.format(url=EVIL)), note)
+
+    def test_a_conditional_or_makes_the_whole_command_untrusted(self):
+        # the create never runs when the first command succeeds, and its link is the one printed first
+        self.distrusted([f"echo {EVIL} || gh pr create --fill", "cat pr-url.txt || gh pr create --fill",
+                         "[ -f x ] && cat x || gh pr create", "gh pr view --json url -q .url || gh pr create --fill",
+                         "gh pr create --fill || true", f"gh pr create --fill || echo {EVIL}", "gh pr create --fill |& cat"])
+
+    def test_a_backgrounded_command_makes_the_whole_command_untrusted(self):
+        self.distrusted([f"gh pr create --fill & echo {EVIL}", f"gh pr create --fill &\necho {EVIL}", "echo hi & gh pr create --fill"])
+
+    def test_arithmetic_and_other_unmodeled_shell_syntax_make_the_command_untrusted(self):
+        self.distrusted([f"(( 1<<X )); gh pr create --fill\necho {EVIL}", f"echo $(( 1<<X )); gh pr create --fill\necho {EVIL}",
+                         f"x=$[ 1<<X ]; gh pr create --fill\necho {EVIL}", "[[ -f x ]] && gh pr create --fill",
+                         f"case x in x) gh pr create --fill;; esac\necho {EVIL}", f"{{ gh pr create --fill; echo {EVIL}; }}",
+                         f"f() {{ gh pr create --fill; }}; f\necho {EVIL}", f"(gh pr create --fill; echo {EVIL})",
+                         "gh pr create --fill <(echo x)", "gh pr create --fill >(cat)", "gh pr create --fill ;; echo x"])
+
+    def test_a_heredoc_opener_that_is_not_well_formed_makes_the_command_untrusted(self):
+        self.distrusted(["gh pr create --fill <<$DELIM", "gh pr create --fill << )", "gh pr create --fill <<"])
+        self.distrusted(["gh pr create --fill <<EOF\nnever ends", "gh pr create --fill <<EOF\nbody\nEOF\ngh pr create <<EOF2"])
+
+    def test_ansi_c_quoting_makes_the_command_untrusted(self):
+        # `$'\''` is one quoted quote to the shell; read plainly it hides the echo inside a quote, in the second form with every quote balanced
+        self.distrusted([f"gh pr create --fill --title $'\\'' ; echo {EVIL} ; : $'\\''", f"gh pr create --fill --title $'\\'' ; echo {EVIL} ; : \\'",
+                         "gh pr create --fill --title $'a'", 'gh pr create --fill --title $"a"'])
+
+    def test_anything_before_the_create_beyond_plain_commands_makes_the_command_untrusted(self):
+        # a command that ends the line, rewires it or is not on the short list of plain ones
+        self.distrusted([f"exit 0; gh pr create --fill\necho {EVIL}", "exit 0; gh pr create --fill", "eval 'gh() { :; }'; gh pr create --fill",
+                         "source ./x.sh && gh pr create --fill", "if true; then true; fi; gh pr create --fill", "bash -c 'echo hi'; gh pr create --fill",
+                         "time gh pr create --fill", "sudo gh pr create --fill", "env X=1 gh pr create --fill", "! true; gh pr create --fill"])
+
+    def test_a_create_that_prints_no_link_or_whose_stdout_goes_elsewhere_is_untrusted(self):
+        self.distrusted([f"echo {EVIL}; gh pr create --web", f"echo {EVIL}; gh pr create --fill -w", f"echo {EVIL}; gh pr create --fill --dry-run",
+                         f"echo {EVIL}; gh pr create --fill > /dev/null", f"echo {EVIL}; gh pr create --fill >&2", f"echo {EVIL}; gh pr create --fill &> /dev/null",
+                         f"echo {EVIL}; gh pr create --fill >> log", f"echo {EVIL}; gh pr create --fill 1> /dev/null", f"echo {EVIL}; gh pr create --help"])
+
+    def test_the_stderr_of_the_create_may_go_anywhere(self):
+        for n, command in enumerate(["gh pr create --fill 2>&1", "gh pr create --fill 2>/dev/null", "gh pr create --fill 2>> err.log",
+                                     "gh pr create --fill --title 'a -w b' < body.md"]):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"e{n}")))
+
     def test_the_forms_of_a_real_create_are_anchored(self):
         body_file = "gh pr create --title t --body-file - <<'EOF'\nthe body, with gh pr view in it\nEOF"
         substitution = "gh pr create --title \"a; b\" --body \"$(cat <<'EOF'\nsummary \"quoted\" and `gh pr view`\n# not a comment\nEOF\n)\""
@@ -520,6 +572,43 @@ class PickingRules(unittest.TestCase):
         self.assertIsNotNone(self.pick(it)[0])
 
 
+class Shapes(unittest.TestCase):
+    """`shape_of` returns None for anything it does not fully model, and the segments of the line for what it does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module("ptn_shapes")
+
+    def test_what_is_modeled_is_cut_like_the_shell_cuts_it(self):
+        cases = [("a && b; c | d\ne", ["a", "b", "c", "d", "e"]),
+                 ('echo "a; b || c" && x', ['echo "a; b || c"', "x"]),
+                 ("echo 'a & b'; y", ["echo 'a & b'", "y"]),
+                 ("x # y || z\nw", ["x", "w"]),
+                 ("cat <<EOF\nbody || & ((\nEOF\nnext", ["cat <<EOF", "next"]),
+                 ("x $(a || b & c) y; z", ["x $(a || b & c) y", "z"]),
+                 ("x `a || b` y", ["x `a || b` y"]),
+                 ('x "$(a || "b c" )" y; z', ['x "$(a || "b c" )" y', "z"]),
+                 ("a 2>&1 | b", ["a 2>&1", "b"]), ("a <<< word; b", ["a <<< word", "b"]), ("", []), (" ; ;\n", [])]
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                segs = self.m.shape_of(cmd)
+                self.assertIsNotNone(segs)
+                self.assertEqual([t for _s, t, _b, _o in segs], want)
+
+    def test_what_is_not_modeled_is_none(self):
+        for cmd in ("a || b", "a & b", "a &", "a |& b", "a ;; b", "(a)", "a)", "((1))", "$((1))", "$'a'", '$"a"', "$[1]", "${a:-b}", "${a",
+                    "a <(b)", "a >(b)", "a <<", "a << )", "a <<$X", "echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "echo $(a <<EOF)",
+                    "cat <<EOF\nnever ends", "echo $(a $'b')", 'echo "$((1))"', 'echo "${a b}"', "echo `a $'b'`"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.shape_of(cmd))
+
+    def test_the_stdout_of_a_segment_is_told_from_its_stderr(self):
+        for cmd, out in (("a > f", True), ("a >> f", True), ("a 1> f", True), ("a >&2", True), ("a &> f", True), ("a >| f", True), ("a3> f", True),
+                         ("a 2> f", False), ("a 2>> f", False), ("a 2>&1", False), ("a < f", False), ("a <&3", False), ("a 'x > y'", False)):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.m.shape_of(cmd)[0][3], out)
+
+
 class ItemsThatDoNotCount(Base):
     def test_a_waiting_item_gets_a_project_wide_anchor_with_the_reason(self):
         self.ctl("get.out", answer(record("a7", "item-7", ME, f"{ME}: step", until="2099-01-01", wait_kind="time", phase="waiting")))
@@ -562,7 +651,17 @@ class ItemsThatDoNotCount(Base):
     def test_a_400_on_a_project_wide_add_is_not_retried(self):
         self.ctl("post.rc", "1")
         self.ctl("post.err", "stackshot: anchors not added [400] Refused: no project")
-        self.assertIn("Not anchored automatically", self.run_hook(gh_event(PR)))
+        note = self.run_hook(gh_event(PR))
+        self.assertEqual(note, OLDER.format(url=PR) + " Not anchored automatically: the anchor call failed (stackshot: anchors not added [400] Refused: no project).")
+        self.assertEqual(self.posted(), [{"project": PROJECT, "add": [PR], "sender": ME}])
+
+    def test_a_400_with_a_waiting_item_sent_no_item_and_is_not_retried(self):
+        # no item was named in the add (the only item waits), so a refusal has nothing to retry without
+        self.ctl("get.out", answer(record("a7", "item-7", ME, f"{ME}: step", until="2099-01-01", wait_kind="time", phase="waiting")))
+        self.ctl("post.rc", "1")
+        self.ctl("post.err", "stackshot: anchors not added [400] Refused: no project")
+        note = self.run_hook(gh_event(PR))
+        self.assertEqual(note, OLDER.format(url=PR) + " Not anchored automatically: the anchor call failed (stackshot: anchors not added [400] Refused: no project).")
         self.assertEqual(len(self.posted()), 1)
 
 
@@ -717,6 +816,8 @@ if mode == "boom":
     m.anchor = boom
 elif mode == "hang":                                   # a client call that ignores its timeout
     m.call_client = lambda *a, **k: time.sleep(60)
+elif mode == "real-client-hang":                      # the real client call (a stand-in that sleeps), ended by an alarm at 1 s
+    m.ALARM_S = 1
 elif mode == "hang-after-post":                        # the add is posted, then the marker write hangs
     m.call_client = lambda client, args, body, timeout: (0, ANSWER if args[0] == "get" else "", "")
     m.mark = lambda *a: time.sleep(60)
@@ -726,10 +827,10 @@ sys.exit(m.main())
 
 
 class Backstops(Base):
-    def child(self, mode, ev=None, timeout=25):
+    def child(self, mode, ev=None, timeout=25, env_extra=None):
         t = time.monotonic()
         r = subprocess.run([sys.executable, "-c", RUNNER, S.HOOKS, mode], input=json.dumps(ev or gh_event(PR)).encode(),
-                           capture_output=True, env=self.env(), timeout=timeout, cwd=self.home)
+                           capture_output=True, env=self.env(**(env_extra or {})), timeout=timeout, cwd=self.home)
         return r, time.monotonic() - t
 
     def one_json_line(self, r):
@@ -746,6 +847,36 @@ class Backstops(Base):
         r, took = self.child("hang")
         self.assertEqual(self.one_json_line(r), OLDER.format(url=PR) + " Not anchored automatically: it timed out.")
         self.assertTrue(8.5 <= took < 11, took)
+
+    def alive(self, pid):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def test_the_alarm_ends_the_client_call_that_is_still_running(self):
+        self.ctl("sleep.get", "25")
+        r, took = self.child("real-client-hang", env_extra={"POST_TOOL_NOTE_CALL_TIMEOUT_S": "20"})
+        self.assertEqual(self.one_json_line(r), OLDER.format(url=PR) + " Not anchored automatically: it timed out.")
+        self.assertTrue(took < 8, took)
+        with open(self.out + ".pid") as f:
+            pid = int(f.read())
+
+        def stray():                                   # only if the hook left it: the process is this test's own stand-in client
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    mine = self.checkout.encode() in f.read()
+            except OSError:
+                return
+            if mine:
+                os.kill(pid, 9)
+        self.addCleanup(stray)
+        for _ in range(30):
+            if not self.alive(pid):
+                break
+            time.sleep(0.1)
+        self.assertFalse(self.alive(pid), "the client call outlived the hook")
 
     def test_an_attempt_that_hangs_after_the_add_was_posted_says_it_was_anchored(self):
         r, _ = self.child("hang-after-post")

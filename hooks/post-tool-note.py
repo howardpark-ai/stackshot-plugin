@@ -32,9 +32,15 @@ prints hookSpecificOutput.additionalContext and exits 0. Two legs:
    an answer that does not parse): the older note, unchanged, with one short line after it saying why:
      Created <url>. Anchor it now: stackshot anchors(project=..., add=[<url>]) (post-tool-note.py). Not anchored automatically: <why>.
    A URL that is not a pull request or an issue (a repository, a branch) is not sent to the route: the older note alone.
-   The hook anchors a URL only when it can tell the create call itself printed it. For Bash: the command line ends in `gh pr create` or
-   `gh issue create` as a real command (at the start of the command or after `&&`, `;`, `|` or a newline, never inside quotes, a
-   heredoc or after a `#`), and the LAST non-empty line of STDOUT is exactly the URL. For a GitHub connector call: the result holds
+   The hook anchors a URL only when it can tell the create call itself printed it. For Bash: the command line is exactly one of the
+   shapes it fully models (`trusted_create`): optional plain commands (`cd`, `git`, `echo`, `printf`, `cat`, `true`, `:`, `pwd`, `ls`,
+   `test`, `[`, `export`, or only `NAME=value` words) joined by `&&`, `;`, `|` or a newline, then ONE `gh pr create` or
+   `gh issue create` as the last command (any `NAME=value` words and `-R x` before it; `--body-file - <<'EOF'` and `$(cat <<'EOF'...)`
+   bodies, `2>&1` and backslash continuations allowed), with no `--web`, `-w`, `--dry-run` or help flag and no redirection of its stdout, and
+   the LAST non-empty line of STDOUT is exactly the URL. Anything the scanner does not fully model makes the whole command untrusted: a
+   `||` or a lone `&` outside quotes, heredoc bodies and `$(...)`, a `<<` that is not a well-formed heredoc opener, `$'...'`, `$((`, `((`,
+   `[[`, `<(`, `{ }` groups, a subshell, a function definition, `case`, `exit`, `eval` and any other command word not listed above,
+   an unclosed quote, substitution or heredoc. For a GitHub connector call: the result holds
    exactly one distinct pull request or issue URL. Anything else (a URL met in other output, a command that only mentions
    `gh pr create`) gets the older note and "the link did not come from the create call itself".
    Each of the two client calls has a short timeout and the attempt as a whole a budget of 7.5 s (the hook's own limit is 10 s); a
@@ -209,11 +215,196 @@ def real_segments(cmd):
     return segs
 
 
+# What may stand before the create command: plain commands that return and let the line go on (none of them can end the line early, skip
+# the create or rewire its output), and a word list is the whole allowlist: any other command word makes the command untrusted.
+SAFE_BEFORE = frozenset(("cd", "git", "echo", "printf", "cat", "true", ":", "pwd", "ls", "test", "[", "export"))
+ASSIGNS = re.compile(r"(?:[A-Za-z_]\w*=\S*(?:\s+|$))*")
+QUIET_FLAG = re.compile(r"(?<!\S)(?:--web|--dry-run|--help|-[A-Za-z]*[wh][A-Za-z]*)(?=[\s=]|$)")   # a create that prints no URL
+STDERR_FD = re.compile(r"(?:^|\s)2$")
+STDOUT_OP = re.compile(r">>|>\||>&|>")
+BRACE_VAR = re.compile(r"\$\{\w+\}")
+
+
+def shape_of(cmd):
+    """The top-level segments of `cmd` as (separator before it, text, text with quoted parts blanked, whether it redirects its stdout), or
+    None when the command holds anything this scanner does not fully model. Models: quotes, `\\` escapes, `$(...)` and backticks (their
+    insides are scanned too), ``, heredocs (`<<`, `<<-`, an optionally quoted word; a body runs to its delimiter line), `<<<`, `#`
+    comments, and the separators `&&`, `;`, `|` and a newline at the top level. Anything else of the shell's syntax (`||`, a lone `&`, `|&`,
+    `;;`, `(`, `((`, `$((`, `$'`, `$"`, `$[`, `<(`, `>(`, a `<<` that opens no heredoc, an unclosed quote, substitution or heredoc) is None."""
+    segs = []
+    bad = []
+
+    def fail():
+        bad.append(1)
+
+    def walk(src, i, mode):                        # mode: "top", "sub" (inside $( ), ends at its `)`) or "tick" (inside backticks)
+        n = len(src)
+        top = mode == "top"
+        cur, blank, pend = [], [], []
+        st = {"sep": "", "out": False}
+
+        def end(sep):
+            text = "".join(cur).strip()
+            if top and text:
+                segs.append((st["sep"], text, " ".join("".join(blank).split()), st["out"]))
+            cur.clear(); blank.clear()
+            st["sep"], st["out"] = sep, False
+
+        def put(chunk, b="Q"):
+            cur.append(chunk); blank.append(b)
+
+        while i < n and not bad:
+            c = src[i]
+            if c == "\\":
+                put(src[i:i + 2], " " if src.startswith("\\\n", i) else "Q"); i += 2
+            elif c == "'":
+                j = src.find("'", i + 1)
+                if j < 0:
+                    fail(); break
+                put(src[i:j + 1]); i = j + 1
+            elif c == '"':
+                j = i + 1
+                while j < n and src[j] != '"':
+                    if src[j] == "\\":
+                        j += 2
+                    elif src.startswith("$((", j):
+                        fail(); break
+                    elif src.startswith("$(", j):
+                        j = walk(src, j + 2, "sub")
+                    elif src.startswith("${", j):
+                        m = BRACE_VAR.match(src, j)
+                        if not m:
+                            fail(); break
+                        j = m.end()
+                    elif src[j] == "`":
+                        k = src.find("`", j + 1)
+                        if k < 0:
+                            fail(); break
+                        walk(src[j + 1:k], 0, "tick"); j = k + 1
+                    else:
+                        j += 1
+                if bad:
+                    break
+                if j >= n:
+                    fail(); break
+                put(src[i:j + 1]); i = j + 1
+            elif c == "`":
+                k = src.find("`", i + 1)
+                if k < 0:
+                    fail(); break
+                walk(src[i + 1:k], 0, "tick")
+                put(src[i:k + 1]); i = k + 1
+            elif c == "$":
+                if src.startswith("$((", i) or src.startswith("$'", i) or src.startswith('$"', i) or src.startswith("$[", i):
+                    fail(); break
+                if src.startswith("$(", i):
+                    j = walk(src, i + 2, "sub")
+                    put(src[i:j]); i = j
+                elif src.startswith("${", i):
+                    m = BRACE_VAR.match(src, i)
+                    if not m:
+                        fail(); break
+                    put(m.group(0)); i = m.end()
+                else:
+                    put(c, c); i += 1
+            elif c == "#" and (not cur or cur[-1][-1:].isspace()):
+                j = src.find("\n", i)
+                i = n if j < 0 else j
+            elif c == "<":
+                if src.startswith("<<<", i):
+                    put("<<<", "<<<"); i += 3
+                elif src.startswith("<<", i):
+                    m = HEREDOC.match(src, i)
+                    if not m:
+                        fail(); break
+                    pend.append(next(g for g in m.groups()[1:] if g is not None))
+                    put(m.group(0), "<<Q"); i = m.end()
+                elif src.startswith("<(", i):
+                    fail(); break
+                elif src.startswith("<&", i):
+                    put("<&", "<&"); i += 2
+                else:
+                    put(c, c); i += 1
+            elif c == ">":
+                if src.startswith(">(", i):
+                    fail(); break
+                m = STDOUT_OP.match(src, i)
+                if not STDERR_FD.search("".join(cur)):
+                    st["out"] = True                  # a redirection of stdout (`2>` alone is the stderr of the command)
+                put(m.group(0), m.group(0)); i = m.end()
+            elif c == "&":
+                if src.startswith("&&", i):
+                    end("&&"); i += 2
+                elif src.startswith("&>", i):
+                    st["out"] = True
+                    put("&>", "&>"); i += 2
+                else:
+                    if top:
+                        fail(); break                 # a command sent to the background
+                    put(c, c); i += 1
+            elif c == "|":
+                if src.startswith("|&", i) or (top and src.startswith("||", i)):
+                    fail(); break
+                if src.startswith("||", i):
+                    end("||"); i += 2
+                else:
+                    end("|"); i += 1
+            elif c == ";":
+                if src[i + 1:i + 2] in (";", "&"):
+                    fail(); break
+                end(";"); i += 1
+            elif c == "(":
+                fail(); break
+            elif c == ")":
+                if mode == "sub" and not pend:
+                    return i + 1
+                fail(); break
+            elif c == "\n":
+                end("\n"); i += 1
+                while pend:
+                    delim, found = pend.pop(0), False
+                    while i < n:
+                        j = src.find("\n", i)
+                        line = src[i:n if j < 0 else j]
+                        i = n if j < 0 else j + 1
+                        if line.strip("\t") == delim or line.strip() == delim:
+                            found = True
+                            break
+                    if not found:
+                        fail(); break
+            else:
+                put(c, c); i += 1
+        end("")
+        if mode == "sub" or pend:
+            fail()                                    # a `$(` never closed, or a heredoc whose body never ended
+        return n
+
+    walk(cmd, 0, "top")
+    return None if bad else segs
+
+
+def trusted_create(cmd):
+    """The match of the create command when the whole command line is the shape the hook trusts (see the module docstring), else None."""
+    segs = shape_of(cmd)
+    if not segs:
+        return None
+    _sep, text, blank, redirected = segs[-1]
+    m = CREATE_SEGMENT.match(text)
+    if not m or redirected or QUIET_FLAG.search(blank):
+        return None
+    for _s, _t, b, _o in segs[:-1]:
+        words = ASSIGNS.sub("", b, count=1).split()
+        if words and words[0] not in SAFE_BEFORE:
+            return None
+    return m
+
+
 def gh_strict_url(cmd, resp):
     """The URL a `gh pr create` / `gh issue create` printed, when it can be told that this command printed it: the command line ends in
-    that command as a real command, and the last non-empty line of its STDOUT (not stderr) is exactly the URL. Else ""."""
+    that command in a shape `trusted_create` fully models, and the last non-empty line of its STDOUT (not stderr) is exactly the URL.
+    Else ""."""
     segs = real_segments(cmd)
-    m = CREATE_SEGMENT.match(segs[-1]) if segs else None
+    m = trusted_create(cmd) if segs and CREATE_SEGMENT.match(segs[-1]) else None     # both scanners must agree
     stdout = resp.get("stdout") if isinstance(resp, dict) else None
     if not m or not isinstance(stdout, str):
         return ""
@@ -285,16 +476,41 @@ def call_timeout():
         return 3.5
 
 
+_CHILD = None                          # the client call running now, so the backstop alarm can end it
+
+
+def kill_group(p):
+    """End a client call and everything it started (it runs as its own session, so its group is its pid)."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
 def call_client(client, args, body, timeout):
     """One client call -> (exit code, stdout, stderr); the exit code is None for a call that timed out or did not start."""
+    global _CHILD
     try:
-        kw = {"input": body.encode("utf-8")} if body is not None else {"stdin": subprocess.DEVNULL}
-        p = subprocess.run([sys.executable, client, *args], capture_output=True, timeout=timeout, **kw)
-    except subprocess.TimeoutExpired:
-        return None, "", "timed out"
+        p = subprocess.Popen([sys.executable, client, *args], stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     except Exception as e:
         return None, "", f"could not start ({type(e).__name__})"
-    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+    _CHILD = p
+    try:
+        out, err = p.communicate(input=body.encode("utf-8") if body is not None else None, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        try:
+            p.communicate(timeout=1)
+        except Exception:
+            pass
+        return None, "", "timed out"
+    except Exception as e:
+        kill_group(p)
+        return None, "", f"could not start ({type(e).__name__})"
+    finally:
+        _CHILD = None
+    return p.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
 def refusal(what, rc, out, err):
@@ -515,6 +731,8 @@ def _alarm(*_a):
     """The backstop: the attempt ran past 9 s, so print what stands (the older note, or the anchored line once the add was posted) and
     leave, inside the hook's limit."""
     try:
+        if _CHILD is not None:
+            kill_group(_CHILD)                       # a client call still running does not outlive the hook
         sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": _PENDING}}, ensure_ascii=False))
         sys.stdout.flush()
     finally:
