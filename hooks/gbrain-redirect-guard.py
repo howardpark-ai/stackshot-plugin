@@ -39,8 +39,28 @@ lookup says it is not there, never when it could not look.
 Only the portal entries listed in the setting gbrain_entries (default `gbrain`) are covered, since the lookup reads this box's own
 gbrain database: a second brain served by another host needs its own lookup first, and stays out.
 
+A brain whose database is not on this box (the local psql and CLI read a stale copy, or none) is looked up by a command of your own:
+the setting gbrain_lookup_command. When it is set the hook runs exactly that command for the lookup and neither the local psql nor
+the gbrain CLI is ever consulted; when it is unset the lookup is the one above, unchanged. The contract with the command:
+  * argv: the setting, a JSON list of strings (or one plain string, split like a shell would); `~` in the first word is expanded.
+    No shell is involved.
+  * stdin: one JSON object {"sql": "<script>", "variables": {"rows": "<json>", "banner": "<regex>"}}. The script is for psql: it
+    refers to the variables as :'rows' and :'banner', opens a read-only transaction, selects one row per page found and ends with
+    a select of a line that names this run, `lookup-complete-<random hex>`. The command runs the script on the live database with
+    psql's variables set from "variables" (`psql -v name=value`), unaligned, tuples-only, tab-separated (`-A -t -F <tab>`),
+    stopping at the first error (`-v ON_ERROR_STOP=1`).
+  * stdout: exactly what psql printed (the rows, then the end line); exit status 0. stderr is discarded.
+  * The command gets what is left of the budget (GBRAIN_REDIRECT_BUDGET, 2 s) and runs in its own process group: when the time is
+    up, or the hook is ended by its own timer, the whole group is killed, so nothing the command started outlives the hook.
+  * Fail open: a command that is missing or not executable, exits nonzero, runs out of time, raises, or prints rows that are not
+    followed by this run's end line (as the last line) tells the hook nothing about the slugs, so every call goes on. An exit 0 with
+    no output is not "no such page" but "the command did not run the script": only the end line proves the query ran, and a page
+    counts as new (which the third check refuses) only when the query ran and found no row.
+
 Settings (plugin.json key or STACKSHOT_PLUGIN_<NAME>; see the README):
   gbrain_entries            portal entry ids of the gbrain whose database is on this box (default ["gbrain"])
+  gbrain_lookup_command     the command that looks pages up on a brain whose database is not on this box (default unset: the local
+                            psql, then the gbrain CLI); the contract is above
   gbrain_moved_banner       regex of the banner line of a moved page, see BANNER below (default: any "> **...record for this page is in ...")
   gbrain_moved_keep         regexes (case-insensitive) of slugs that are never refused as moved or as a new page of the other brain (default none)
   gbrain_moved_write_hint   a sentence appended to the moved-page refusal, saying how to write on the other brain; {tool}, {slug}
@@ -62,7 +82,7 @@ tool call.
 
 A refusal is a JSON permissionDecision "deny" on stdout with exit 0. Any error: silent exit 0.
 """
-import glob, json, os, re, shutil, signal, subprocess, sys, time
+import glob, json, os, re, shlex, shutil, signal, subprocess, sys, time, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _config  # noqa: E402
@@ -185,13 +205,9 @@ def merge(old, new):
             "redirect_to": old["redirect_to"] or new["redirect_to"], "banner": old["banner"] or new["banner"]}
 
 
-def lookup_psql(pairs, deadline, banner):
-    """{slug: {exists, type, redirect_to, banner}} of the pages among `pairs`, by one read-only query, a slug it did not find with
-    exists False; None when psql is absent or the query fails."""
-    psql = os.environ.get("PSQL_BIN") or shutil.which("psql")
-    if not psql or not os.path.isfile(psql) or not os.access(psql, os.X_OK):
-        return None
-    rows = json.dumps([{"slug": s, "src": src} for s, src, *_ in pairs])
+def lookup_sql(sentinel=None):
+    """The one read-only lookup, as a psql script that reads the variables `rows` and `banner`. With a `sentinel` it ends with a
+    select of that line, so a caller that did not run the script itself can tell whether it ran to the end."""
     sql = ("\\set ON_ERROR_STOP on\n"
            "begin transaction read only;\n"
            "select p.slug, p.type, coalesce(p.frontmatter->>'redirect_to',''), "
@@ -200,19 +216,20 @@ def lookup_psql(pairs, deadline, banner):
            "on p.slug = w.slug and (w.src is null or p.source_id = w.src) "
            "where p.deleted_at is null;\n"
            "commit;\n")
-    try:
-        r = subprocess.run([psql, "-X", "-q", "-A", "-t", "-F", "\t", "-d", os.environ.get("GBRAIN_DB") or "gbrain",
-                            "-v", "rows=" + rows, "-v", "banner=" + banner], input=sql, capture_output=True, text=True,
-                           env=clean_env(), cwd=os.path.expanduser("~"), timeout=max(0.1, deadline - time.time()))
-    except Exception:
-        return None
-    if r.returncode != 0:
-        _config.note("gbrain-redirect-guard", f"psql exited {r.returncode}, so the gbrain CLI is tried instead; if the setting "
-                     "gbrain_moved_banner is a pattern Postgres rejects, fix it (Python and Postgres read the same pattern)")
-        return None
+    return sql + ("select '%s';\n" % sentinel if sentinel else "")
+
+
+def lookup_rows(pairs):
+    """The psql variable `rows`: the slugs (and their source ids) to look up, as JSON."""
+    return json.dumps([{"slug": s, "src": src} for s, src, *_ in pairs])
+
+
+def parse_rows(pairs, lines):
+    """{slug: {exists, type, redirect_to, banner}} from the tab-separated lines the lookup printed, a slug without a row with
+    exists False. A line of fewer than three columns is skipped."""
     found = {s: dict(NOT_THERE) for s, *_ in pairs}
     seen = {}
-    for line in r.stdout.splitlines():
+    for line in lines:
         cols = line.split("\t")
         if len(cols) < 3:
             continue
@@ -220,6 +237,88 @@ def lookup_psql(pairs, deadline, banner):
                                                   "banner": cols[3].strip() if len(cols) > 3 else ""})
     found.update(seen)
     return found
+
+
+def lookup_psql(pairs, deadline, banner):
+    """{slug: {exists, type, redirect_to, banner}} of the pages among `pairs`, by one read-only query, a slug it did not find with
+    exists False; None when psql is absent or the query fails."""
+    psql = os.environ.get("PSQL_BIN") or shutil.which("psql")
+    if not psql or not os.path.isfile(psql) or not os.access(psql, os.X_OK):
+        return None
+    try:
+        r = subprocess.run([psql, "-X", "-q", "-A", "-t", "-F", "\t", "-d", os.environ.get("GBRAIN_DB") or "gbrain",
+                            "-v", "rows=" + lookup_rows(pairs), "-v", "banner=" + banner], input=lookup_sql(), capture_output=True,
+                           text=True, env=clean_env(), cwd=os.path.expanduser("~"), timeout=max(0.1, deadline - time.time()))
+    except Exception:
+        return None
+    if r.returncode != 0:
+        _config.note("gbrain-redirect-guard", f"psql exited {r.returncode}, so the gbrain CLI is tried instead; if the setting "
+                     "gbrain_moved_banner is a pattern Postgres rejects, fix it (Python and Postgres read the same pattern)")
+        return None
+    return parse_rows(pairs, r.stdout.splitlines())
+
+
+def lookup_command_argv():
+    """The command of the setting gbrain_lookup_command: None when it is unset (or empty), else the argument list with `~` in its
+    first word expanded; [] when the setting is set but cannot be a command (then nothing is looked up and no local database is read)."""
+    raw = _config.get("gbrain_lookup_command")
+    if isinstance(raw, str):
+        try:
+            argv = shlex.split(raw)
+        except ValueError:
+            return []
+    elif isinstance(raw, list):
+        argv = [x for x in raw if isinstance(x, str)] if all(isinstance(x, str) for x in raw) else [""]
+    else:
+        return None if raw is None else []
+    if not argv:
+        return None if (raw == [] or raw == "") else []
+    return [os.path.expanduser(argv[0])] + argv[1:]
+
+
+def _end_group(proc):
+    """Kill the command's whole process group (it was started as its own session, so the group is its pid) and reap it. Only while the
+    command has not been reaped: its pid is then still ours."""
+    if proc.returncode is not None:
+        return
+    try:
+        if os.getpgid(proc.pid) == proc.pid != os.getpgrp():
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=1)
+    except Exception:
+        pass
+
+
+def lookup_command(pairs, deadline, banner, argv):
+    """{slug: info} from the command of gbrain_lookup_command (the contract is in the module docstring); {} (nothing known, every
+    call goes on) when the command is missing, fails, runs out of time or does not print the end line of this run."""
+    left = deadline - time.time()
+    if not argv or not argv[0] or left < 0.1:
+        return {}
+    sentinel = "lookup-complete-" + uuid.uuid4().hex
+    payload = json.dumps({"sql": lookup_sql(sentinel), "variables": {"rows": lookup_rows(pairs), "banner": banner}})
+    proc = None
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=clean_env(),
+                                cwd=os.path.expanduser("~"), start_new_session=True, text=True, encoding="utf-8", errors="replace")
+        out, _ = proc.communicate(payload, timeout=left)
+    except Exception:                                 # not found, not executable, out of time, a broken pipe
+        return {}
+    finally:                                          # also when the hook's own timer ends it (SystemExit)
+        if proc is not None:
+            _end_group(proc)
+    if proc.returncode != 0:
+        return {}
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines or lines[-1] != sentinel:
+        return {}
+    rows = lines[:-1]
+    if any(len(ln.split("\t")) < 3 for ln in rows):
+        return {}
+    return parse_rows(pairs, rows)
 
 
 def lookup_cli(pairs, deadline, banner_re):
@@ -268,6 +367,9 @@ def lookup_cli(pairs, deadline, banner_re):
 
 def lookup(pairs, banner_re, banner):
     deadline = time.time() + BUDGET
+    argv = lookup_command_argv()
+    if argv is not None:                              # a command of its own: never the local psql or CLI
+        return lookup_command(pairs, deadline, banner, argv)
     found = lookup_psql(pairs, deadline, banner)
     if found is None:
         found = lookup_cli(pairs, deadline, banner_re)

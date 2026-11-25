@@ -13,7 +13,7 @@ missing, and goes on. None of them can fail a session: any error or unreadable i
 | sala | `build-stops`, `front-watch-gate` (session ids), the `spawn` skill | names come from stackshot's fleet store or Claude's own session files; `spawn` says sala is not installed and stops |
 | gbrain on `PATH` | `gbrain-writeback-hook` | no write-back |
 | `setsid` (else `nohup`) | `gbrain-writeback-hook` | without `setsid` it detaches with `nohup`; with neither, one stderr line and no write-back |
-| `psql`, or the gbrain CLI at `~/.bun/bin/gbrain` (`GBRAIN_BIN`) | `gbrain-redirect-guard` | a write to a redirect stub or a moved page, or a new page of the other brain, is not caught |
+| `psql`, or the gbrain CLI at `~/.bun/bin/gbrain` (`GBRAIN_BIN`) | `gbrain-redirect-guard` | a write to a redirect stub or a moved page, or a new page of the other brain, is not caught. With the setting `gbrain_lookup_command` set, neither is read: the command is |
 
 The scopes of the stack build on one another: the board alone (stackshot), then with sala, then the full setup with gbrain. This
 plugin serves the full setup, and degrades to whatever is installed.
