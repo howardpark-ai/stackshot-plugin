@@ -9,8 +9,12 @@ server is never made: the client is always the stand-in."""
 import fcntl
 import hashlib
 import importlib.util
+import itertools
 import json
+import multiprocessing
 import os
+import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -461,8 +465,7 @@ class Narrowing(Base):
                          f"echo {EVIL}; gh pr create --fill >> log", f"echo {EVIL}; gh pr create --fill 1> /dev/null", f"echo {EVIL}; gh pr create --help"])
 
     def test_the_stderr_of_the_create_may_go_anywhere(self):
-        for n, command in enumerate(["gh pr create --fill 2>&1", "gh pr create --fill 2>/dev/null", "gh pr create --fill 2>> err.log",
-                                     "gh pr create --fill --title 'a -w b' < body.md"]):
+        for n, command in enumerate(["gh pr create --fill 2>&1", "gh pr create --fill 2>/dev/null", "gh pr create --fill --title 'a -w b' 2>&1"]):
             with self.subTest(command=command):
                 self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"e{n}")))
 
@@ -635,8 +638,7 @@ class Narrowing(Base):
     def test_an_expansion_in_the_value_of_a_flag_that_takes_one_is_trusted(self):
         # the value of --title and the like can never become a flag of its own; `$( )` and backticks only inside double quotes
         body = "gh pr create --title \"x $Y\" --body \"$(cat <<'EOF'\nthe body, with --web and $HOME in it\nEOF\n)\""
-        forms = [body, 'gh pr create --title "x $Y" --fill', 'gh pr create --title="x $Y" --fill', 'gh pr create -t "$(git log -1 --format=%s)"',
-                 "gh pr create --fill --body \"`git log -1`\"", 'gh pr create -R "$R" --fill', 'gh -R "$R" pr create --fill', 'gh pr create --base "$B" --head "$H" --fill',
+        forms = [body, 'gh pr create --title "x $Y" --fill', 'gh pr create --title="x $Y" --fill', 'gh pr create -R "$R" --fill', 'gh -R "$R" pr create --fill', 'gh pr create --base "$B" --head "$H" --fill',
                  'gh pr create --label "$L" --assignee "$A" --fill', 'gh pr create --body-file "$F" --fill', "gh pr create --fill",
                  "gh pr create --title 'a $b' --fill", "W=--web gh pr create --fill", 'T="x $Y" gh pr create --fill', 'echo "$X" && gh pr create --fill']
         for n, command in enumerate(forms):
@@ -676,6 +678,342 @@ class Narrowing(Base):
     def test_a_heredoc_that_is_never_closed_makes_the_command_untrusted(self):
         # no newline at all after the opener: the body is empty, and where the command ends is not modeled
         self.distrusted([f"echo {EVIL}; gh pr create --fill <<EOF", f"echo {EVIL}; gh pr create --fill <<'EOF'", f"echo {EVIL}; gh pr create --fill <<-EOF"])
+
+
+# ---- the bash differential: a command the scanner trusts, run by bash with `gh` a function that only prints its argv -------------------
+GH_STUB = 'gh(){ printf "%s\\0" "$@" > "$ARGV_FILE"; }\n'            # never a real gh: it writes its argv, NUL-separated, to a file
+ARGV_VALUE_FLAGS = frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H", "--label", "-l",
+                              "--assignee", "-a"))
+ARGV_ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=|-[tbFRBHla].")
+TOKENS = [" ", "<", ">", "(", ")", ";", "~", "$", "@", "*", '"', "'", "\\", "`", "-", "w", "e", "b", "case"]
+DIFF_PREFIX = ["", "cd d && ", "git push && ", "echo U; ", "W=--web; ", "W=-w; HOME=--web; ", "export HOME=-w; ", "HOME=--dry-run; ", "A=1 ", "cd d && git push && ",
+               'W="--web x"; X=; echo U; ', "true;\n", "echo a | cat; "]
+DIFF_GOOD = ["--fill", "--title t", '--title "x $Y"', "--title 'a b'", "--body b", '--body "$(cat <<\'EOF\'\nthe body --web\nEOF\n)"', "--body-file - <<'EOF'\nbody\nEOF",
+             "2>&1", "2>/dev/null", "-R x/y", "-B main", "-H feat", "-l bug", "-a me", "-d", "-t t", '-F "$F"', '--repo="$R"', '--title="a $B"', "--draft",
+             "# a comment"]
+DIFF_BAD = ["--web<f", "-w<f", "--dry-run<<<x", "--help<&-", "--web<<EOF\nx\nEOF", "--title t --web</dev/null", "~", "~/x", '"$@"', '-t "$@" -b "$W"',
+            '-l "$@" -a "$W"', "--title \"$(case a in a) echo '\"' ;; esac)\" --web #'", "$W", '"$W"', "{--web,}", "--web$X", "$(printf -- --web)",
+            "`echo --web`", "-$(echo w)", '"--web"', "--we\\b", "-w", "--web", "*", "?", "[w]", "$HOME", '"$HOME"', '-t"$W"', "--title $W", "> f", "< f", ">&2",
+            "2>$F", "<<EOF\nx\nEOF", "<<'EOF'\nx\nEOF", "--fill -w", "--fill\t--web", "--fill \\\n--web", "-t -w", '-R "$W" -w', "--title=--web", "!", "a}b",
+            "a]b", '"a b" \'c\'']
+DIFF_RAW = ["gh pr create", "--web", "-w", "$W", '"$W"', "<", ">", "~", "$@", "case", "$(", ")", "(", "`", ";", "'", '"', "\\", " ", "\t", "\n", "-t", "-b",
+            "x", "--", "-"]
+_DIFF_MODULE = None                                                   # set before the worker processes are forked
+
+
+def argv_has_quiet_flag(argv):
+    """Whether the words gh would be given hold a flag that stops it printing the link (a value flag's next word is a value, whatever it is)."""
+    skip = False
+    for x in argv:
+        if skip:
+            skip = False
+        elif x in ARGV_VALUE_FLAGS:
+            skip = True
+        elif ARGV_ATTACHED.match(x):
+            continue
+        elif x in ("--web", "-w", "--dry-run", "--help", "-h") or x.startswith(("--web=", "--dry-run=", "--help=")):
+            return True
+        elif re.fullmatch(r"-[A-Za-z]+", x) and ("w" in x or "h" in x):
+            return True
+    return False
+
+
+def run_with_stub(cmd, d):
+    """The argv bash gives `gh` for `cmd` in the folder `d` (None when the command fails or never runs gh)."""
+    af = os.path.join(d, "argv")
+    if os.path.exists(af):
+        os.unlink(af)
+    open(os.path.join(d, "f"), "a").close()                           # the file a `<f` reads
+    try:
+        r = subprocess.run(["bash", "-c", GH_STUB + cmd], capture_output=True, cwd=d, timeout=10, stdin=subprocess.DEVNULL,
+                           env={"PATH": os.environ["PATH"], "HOME": d, "ARGV_FILE": af})
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0 or not os.path.exists(af):
+        return None
+    with open(af, "rb") as f:
+        return f.read().decode("utf-8", "replace").split("\0")[:-1]
+
+
+def bash_argv(cmd):
+    with tempfile.TemporaryDirectory(prefix="ptn-argv-") as d:
+        return run_with_stub(cmd, d)
+
+
+class LockedTemp:
+    """A temp folder, locked with flock while it is in use (so systemd-tmpfiles ageing leaves it alone) and removed on exit."""
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ptn-diff-")
+        self.fd = os.open(self.tmp.name, os.O_RDONLY)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self.tmp.name
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        self.tmp.cleanup()
+
+
+def diff_one(cmd, d, tally, hits):
+    if _DIFF_MODULE.trusted_create(cmd) is None:
+        return
+    tally[0] += 1
+    argv = run_with_stub(cmd, d)
+    if argv is None:
+        return
+    tally[1] += 1
+    if argv_has_quiet_flag(argv):
+        hits.append((cmd, argv))
+
+
+def diff_random_command(rng):
+    kind = rng.random()
+    if kind < 0.45:
+        sep = rng.choice([" ", " ", "\t", " \\\n "])
+        return rng.choice(DIFF_PREFIX) + "gh pr create" + sep + sep.join(rng.choice(DIFF_GOOD + DIFF_BAD) for _ in range(rng.randint(0, 4)))
+    if kind < 0.7:
+        return rng.choice(DIFF_PREFIX) + "gh pr create " + "".join(rng.choice(DIFF_RAW) for _ in range(rng.randint(1, 6)))
+    words = " ".join(rng.choice(DIFF_GOOD + DIFF_BAD[:12]) for _ in range(rng.randint(1, 3)))
+    return rng.choice(DIFF_PREFIX) + "gh pr create " + words + rng.choice(["", " --fill", " # c"])
+
+
+def diff_random_chunk(args):
+    seed, n = args
+    rng = random.Random(seed)
+    tally, hits = [0, 0], []
+    with LockedTemp() as d:
+        for _ in range(n):
+            diff_one(diff_random_command(rng), d, tally, hits)
+    return n, tally[0], tally[1], hits
+
+
+def diff_exhaustive_chunk(args):
+    first, length = args
+    tally, hits = [0, 0], []
+    with LockedTemp() as d:
+        for tail in itertools.product(TOKENS, repeat=length - 1):
+            for prefix in ("gh pr create ", "W=--web; HOME=--web; gh pr create "):
+                diff_one(prefix + first + "".join(tail), d, tally, hits)
+    return len(TOKENS) ** (length - 1), tally[0], tally[1], hits
+
+
+def pool_sum(function, jobs):
+    """Run `function` over `jobs` in forked workers; the sums of its (count, trusted, ran) and its hits joined."""
+    totals, hits = [0, 0, 0], []
+    with multiprocessing.get_context("fork").Pool(max(1, min(20, os.cpu_count() or 1))) as pool:
+        for count, trusted, ran, found in pool.imap_unordered(function, jobs):
+            totals[0] += count; totals[1] += trusted; totals[2] += ran; hits += found
+    return totals[0], totals[1], totals[2], hits
+
+
+def run_differential(module, seed, count):
+    global _DIFF_MODULE
+    _DIFF_MODULE = module
+    per, rest = divmod(count, 20)
+    return pool_sum(diff_random_chunk, [(seed * 100 + i, per + (rest if i == 0 else 0)) for i in range(20)])
+
+
+def run_exhaustive(module, length):
+    """Every string of up to `length` TOKENS after `gh pr create ` (and after a prefix that sets W and HOME to a flag)."""
+    global _DIFF_MODULE
+    _DIFF_MODULE = module
+    return pool_sum(diff_exhaustive_chunk, [(t, n) for n in range(1, length + 1) for t in TOKENS])
+
+
+class Whitelist(unittest.TestCase):
+    """The words of a create are a short whitelist (`words_are_literal`): the shapes outside it are untrusted, the boring ones stay trusted,
+    and a differential against real bash with a stand-in `gh` that prints its argv shows no trusted command runs with a quiet flag."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module("ptn_whitelist")
+
+    def trusted(self, cmd):
+        return self.m.trusted_create(cmd) is not None
+
+    def assertAllUntrusted(self, cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(self.trusted(cmd))
+
+    def assertAllTrusted(self, cmds):
+        for cmd in cmds:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.trusted(cmd))
+
+    def test_a_redirect_glued_to_a_word_cannot_hide_a_quiet_flag(self):
+        # bash ends the word at `<` or `>`: `--web<f` is the flag `--web` and a redirect
+        self.assertAllUntrusted(["gh pr create --web<f", "gh pr create -w<f", "gh pr create --dry-run<<<x", "gh pr create --help<&-",
+                                 "gh pr create --web<<EOF\nx\nEOF", "gh pr create --title t --web</dev/null", "gh pr create --web>f",
+                                 "gh pr create --fill>f", "gh pr create --title t -w>&2"])
+
+    def test_a_case_pattern_cannot_end_a_substitution_early(self):
+        self.assertAllUntrusted(["gh pr create --title \"$(case a in a) echo '\"' ;; esac)\" --web #'",
+                                 "echo \"$(case a in a) echo x ;; esac)\"; gh pr create --fill", "echo `case a in a) x;; esac`; gh pr create --fill",
+                                 "echo \"$(echo case)\"; gh pr create --fill", "echo \"$(echo case; x)\"; gh pr create --fill",
+                                 "echo \"$(echo case&&x)\"; gh pr create --fill", "echo \"$(echo case|x)\"; gh pr create --fill",
+                                 "echo \"$(echo case\ty)\"; gh pr create --fill", "echo \"$(echo case\nx)\"; gh pr create --fill",
+                                 "echo \"$(case)\"; gh pr create --fill", "echo `echo case`; gh pr create --fill"])
+        # only the bare word: other words, quoted ones and a heredoc body that holds it are no case statement
+        self.assertAllTrusted(["echo \"$(echo cases)\"; gh pr create --fill", "echo \"$(echo xcase)\"; gh pr create --fill",
+                               "echo \"$(echo 'case')\"; gh pr create --fill", "echo \"$(echo ca\\se)\"; gh pr create --fill",
+                               "gh pr create --title t --body \"$(cat <<'EOF'\nin that case a) b\ncase x in\nEOF\n)\""])
+
+    def test_an_argument_list_that_can_vanish_cannot_swallow_a_flag(self):
+        # `"$@"` expands to no word at all: `-t "$@" -b "$W"` is `-t -b --web` when $W is --web
+        self.assertAllUntrusted(['gh pr create -t "$@" -b "$W"', 'gh pr create -l "$@" -a "$W"', 'gh pr create -t "$*" -b "$W"', 'gh pr create --title "$@" --fill',
+                                 'gh pr create --title="$@" --fill', 'gh pr create "$@"', 'gh pr create "$*"', 'gh pr create -t "${@}" --fill',
+                                 'gh pr create -t "x $@" --fill', 'gh pr create -t $@ --fill', 'gh pr create -t $* --fill'])
+
+    def test_a_leading_tilde_is_an_expansion(self):
+        self.assertAllUntrusted(["HOME=--web; gh pr create ~", "export HOME=-w; gh pr create ~", "HOME=--dry-run; gh pr create ~/x", "gh pr create ~",
+                                 "gh pr create --fill ~", "gh pr create -t ~ --fill", "gh pr create --title=~ --fill", "gh pr create -t x~y --fill"])
+
+    def test_the_boring_shapes_stay_trusted(self):
+        self.assertAllTrusted(["gh pr create --body \"$(cat <<'EOF'\nthe body, with --web and `x` and $(y) and $HOME in it\nEOF\n)\" --title t",
+                               'gh pr create --title "x $Y"', "gh pr create --fill", "cd dir && git push && gh pr create --title t --body b",
+                               "gh issue create --title 'a b' --body 'c'", "gh pr create --title t --body-file - <<'EOF'\nbody\nEOF", "gh pr create --fill 2>&1",
+                               "gh pr create --fill 2>/dev/null", "W=1 gh -R x/y pr create --fill", "gh pr create --fill # a > b ~ $(x) --web",
+                               "gh pr create --title \"feat(x): a; b > c & d | e\" --fill", "gh pr create --title 'a ~ b < c' --fill",
+                               "gh.exe pr create --fill", "gh pr create\t--fill", "gh\tpr\tcreate\t-t\tx", 'gh pr create --title="a $B" --fill',
+                               'gh pr create --title "${B}" --fill', 'gh pr create -t "$(cat <<\'E_1\'\nx\nE_1\n)"'])
+
+    def test_the_forms_the_whitelist_refuses_are_untrusted(self):
+        self.assertAllUntrusted(["gh pr create --fill > f", "gh pr create --fill >> f", "gh pr create --fill < f", "gh pr create --fill >&2",
+                                 "gh pr create --fill <&3", "gh pr create --fill >| f", "gh pr create --fill &> f", "gh pr create --fill 2> f",
+                                 "gh pr create --fill 2>>f", "gh pr create --fill 2>&1 > f", "gh pr create --fill <<EOF\nx\nEOF", "gh pr create --fill <<-EOF\nx\nEOF",
+                                 "gh pr create --fill <<<x", "gh pr create --fill 2>$F", "gh pr create --fill 2>&$F", "gh pr create --fill 2>f", "gh pr create --fill 2>/dev/nul", "gh pr create --fill 2>>/dev/null",
+                                 "gh pr create --fill 2>&2", "gh pr create --fill 2>/dev/null2", "gh pr create --fill 1>&2", "gh pr create --fill 2> /dev/null", "gh pr create --fill 2>&1x",
+                                 "A=1>f gh pr create --fill", "A=~ gh pr create --fill", "A=$B gh pr create --fill", "A=`x` gh pr create --fill",
+                                 'A="$(x)" gh pr create --fill', "gh pr create *", "gh pr create ?", "gh pr create [w]",
+                                 "gh pr create {--web,}", "gh pr create a}", "gh pr create a]", "gh pr create !", "gh pr create -t !x --fill",
+                                 "gh pr create $W", 'gh pr create "$W"', "gh pr create -t $T", "gh pr create --body \"$(git log -1)\"",
+                                 "gh pr create --title \"`git log -1`\"", 'gh pr create "$(cat <<\'EOF\'\nx\nEOF\n)"', 'gh pr create --title "a$(cat <<\'EOF\'\nx\nEOF\n)"',
+                                 "gh pr create --fill $(x)", "gh pr create --fill `x`", 'gh pr create -R "$R" --fill "$X"', 'gh pr create --fill "a $B"'])
+
+    def test_a_create_whose_words_are_not_a_create_at_all_is_untrusted(self):
+        # no `gh` word before the arguments: nothing for the whitelist to read (words_are_literal itself, not the segment pattern)
+        for cmd in ("A=1 B=2", "echo x", "A=1", "", "x pr create --fill"):
+            with self.subTest(cmd=cmd):
+                segs = self.m.shape_of(cmd)
+                self.assertFalse(segs and self.m.words_are_literal(segs[-1][3]))
+        segs = self.m.shape_of("A=1 gh pr create --fill")
+        self.assertTrue(self.m.words_are_literal(segs[-1][3]))
+
+    def test_a_tab_is_a_blank_between_the_words(self):
+        self.assertAllUntrusted(["gh pr create\t--web", "gh pr create --fill\t--web", "gh pr create --fill\t-w", "gh\tpr\tcreate\t--dry-run",
+                                 "gh pr create\t-t\tx\t--help"])
+        self.assertAllTrusted(["gh pr create -t\t'--web'", "gh pr create\t--title\t'--web'"])    # the value of -t is a title, never a flag
+
+    def test_every_flag_that_takes_a_value_takes_the_next_word(self):
+        for flag in sorted(self.m.VALUE_FLAGS):
+            with self.subTest(flag=flag):
+                self.assertTrue(self.trusted(f"gh pr create {flag} '--web'"))      # --web is its value
+                self.assertFalse(self.trusted(f"gh pr create {flag} x --web"))     # and the next word is a flag again
+                self.assertTrue(self.trusted(f"gh pr create {flag} '-w' --fill"))
+                self.assertFalse(self.trusted(f"gh pr create {flag} --web"))       # a plain quiet word is never trusted, even where it would be a value
+                self.assertFalse(self.trusted(f"gh pr create {flag}"))            # a value that never comes
+        self.assertEqual(self.m.VALUE_FLAGS, frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H",
+                                                        "--label", "-l", "--assignee", "-a")))
+        for flag in ("-d", "--draft", "--fill", "-f"):                              # these take none
+            with self.subTest(flag=flag):
+                self.assertFalse(self.trusted(f"gh pr create {flag} '--web'"))     # no value to swallow it: the quoted --web is the flag
+                self.assertFalse(self.trusted(f"gh pr create {flag} -w"))
+                self.assertTrue(self.trusted(f"gh pr create {flag} --fill"))
+
+    def test_the_value_of_a_flag_may_hold_a_name_only_inside_double_quotes(self):
+        for flag in sorted(self.m.VALUE_FLAGS):
+            with self.subTest(flag=flag):
+                self.assertTrue(self.trusted(f'gh pr create {flag} "x $Y" --fill'))
+                self.assertFalse(self.trusted(f"gh pr create {flag} x$Y --fill"))
+                self.assertFalse(self.trusted(f"gh pr create {flag} $Y --fill"))
+                self.assertTrue(self.trusted(f"gh pr create {flag} 'x $Y' --fill"))
+                self.assertFalse(self.trusted(f'gh pr create {flag} "x `y`" --fill'))
+        for flag in ("--title", "--body", "--body-file", "--repo", "--base", "--head", "--label", "--assignee"):
+            with self.subTest(flag=flag):
+                self.assertTrue(self.trusted(f'gh pr create {flag}="x $Y" --fill'))
+                self.assertFalse(self.trusted(f"gh pr create {flag}=$Y --fill"))
+                self.assertFalse(self.trusted(f"gh pr create {flag}=x`y` --fill"))
+        self.assertFalse(self.trusted('gh pr create --fill="x $Y"'))                # not a flag that takes a value
+        self.assertFalse(self.trusted('gh pr create -d"x $Y"'))
+
+    def test_the_quiet_words_are_read_whole(self):
+        # a cluster of short flags is quiet when it holds w or h, whatever the other letters are; a value after `=` and a newline in it change nothing
+        self.assertAllUntrusted(["gh pr create -w", "gh pr create -h", "gh pr create -dw", "gh pr create -wd", "gh pr create -Dw", "gh pr create -wD", "gh pr create -dh",
+                                 "gh pr create -hd", "gh pr create -xhx", "gh pr create -Zw", "gh pr create -wZ",
+                                 "gh pr create --web=1", "gh pr create '--web=a\nb'", "gh pr create '--dry-run=a\nb'", "gh pr create '--help=\n'",
+                                 "gh pr create --web=", "gh pr create --dry-run", "gh pr create --help"])
+        self.assertAllTrusted(["gh pr create -d", "gh pr create -dD", "gh pr create -x", "gh pr create --draft", "gh pr create --website", "gh pr create --fill --webs"])
+
+    def test_only_the_cat_heredoc_is_a_substitution_a_value_may_hold(self):
+        body = "gh pr create --title t --body \"$(%s)\""
+        for sub in ("sh <<'EOF'\nx\nEOF\n", "cat <<EOF\n$(x)\nEOF\n", "cat <<EOF\nx\nEOF\n", "cat <<'EOF'\nx\nEND\n", "cat <<'EOF'\nx\nEOF\n ", "cat <<'EOF'\nEOF\nmore\nEOF\n",
+                    "cat <<'EOF'\nx\nEOF", "cat f", "cat <<'EOF'\nx\nEOF\necho --web\n", "git log -1"):
+            with self.subTest(sub=sub):
+                self.assertFalse(self.trusted(body % sub))
+        self.assertTrue(self.trusted(body % "cat <<'EOF'\nx\nEOF\n"))
+        self.assertTrue(self.trusted(body % "cat <<'EOF'\nEOF\n"))                           # an empty body
+        self.assertTrue(self.trusted(body % "cat <<'E_1'\nEOF\nx\nE_1\n"))                     # EOF is a line of the body here, not the delimiter
+
+    def test_heredoc_value_reads_the_whole_chunk(self):
+        for chunk, expected in (("\"$(cat <<'EOF'\nx\nEOF\n)\"", True), ("\"$(cat <<'EOF'\n)\"", False), ("\"$(cat <<'EOF'\nEOF)\"", False),
+                                ("\"$(cat <<'EOF'\nx\nEND\n)\"", False), ("\"$(cat <<'EOF'\nx\nEOF\n )\"", False), ("\"$(cat <<'EOF'\nEOF\nx\nEOF\n)\"", False),
+                                ("\"$(sh <<'EOF'\nx\nEOF\n)\"", False), ("\"$(cat <<EOF\nx\nEOF\n)\"", False), ("\"a$(cat <<'EOF'\nx\nEOF\n)\"", False),
+                                ("\"$(cat <<'EOF'\nx\nEOF\n)b\"", False), ("\"$(cat <<'EOF'\nEOF\n)\"", True)):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(self.m.heredoc_value(chunk), expected)
+
+    def test_words_are_literal_reads_a_word_list_that_holds_a_gh(self):
+        def literal(cmd):
+            segs = self.m.shape_of(cmd)
+            return bool(self.m.words_are_literal(segs[-1][3]))
+        for cmd, expected in (("A=1 gh pr create --fill", True), ("gh.exe pr create --fill", True), ("echo gh pr create --fill", False), ("x pr create --fill", False),
+                              ('"gh" pr create --fill', False), ("g\\h pr create --fill", False), ("1A=x gh pr create --fill", False), ("A gh pr create --fill", False), ("ghx pr create --fill", False), ("gh2 pr create --fill", False), ("gh. pr create --fill", False),
+                              ("A=1 B=2", False), ("echo x", False), ("A='x y' gh pr create --fill", True), ('A="x $Y" gh pr create --fill', True),
+                              ("A=$Y gh pr create --fill", False), ("A=`y` gh pr create --fill", False), ('A="`y`" gh pr create --fill', False)):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(literal(cmd), expected)
+
+    def test_a_quoted_or_escaped_gh_is_no_create(self):
+        self.assertAllUntrusted(['"gh" pr create --fill', "'gh' pr create --fill", "g\\h pr create --fill", "1A=x gh pr create --fill"])
+
+    def test_the_word_case_is_only_a_hazard_inside_a_substitution(self):
+        self.assertAllTrusted(["echo case; gh pr create --fill", "echo case && gh pr create --fill", "gh pr create --title case --fill",
+                               "gh pr create --title t --body case", "echo \"case\"; gh pr create --fill"])
+        # an operator ends the word before it: `<case` and `|case` start a word that is `case`
+        self.assertAllUntrusted(["echo \"$(echo <case)\"; gh pr create --fill", "echo \"$(echo x|case)\"; gh pr create --fill",
+                                 "echo \"$(echo x >&2 case)\"; gh pr create --fill", "echo `echo >case`; gh pr create --fill"])
+
+    def test_assignments_before_a_command_do_not_hide_it_from_the_allowlist(self):
+        self.assertAllTrusted(["W=1 echo x; gh pr create --fill", "A=1; gh pr create --fill", "A=1 B=2 git push && gh pr create --fill", "W=--web; echo U; gh pr create --fill"])
+        self.assertAllUntrusted(["A=1 rm x; gh pr create --fill", "rm x; gh pr create --fill", "A=1 B=2 curl x && gh pr create --fill"])
+
+    def test_the_bracket_and_brace_characters_are_refused_alone(self):
+        self.assertAllUntrusted(["gh pr create [", "gh pr create {", "gh pr create x[", "gh pr create x{", "gh pr create ]", "gh pr create }", "gh pr create -t [ --fill",
+                                 "gh pr create --title=[ --fill", "gh pr create --title={ --fill"])
+        self.assertAllTrusted(["gh pr create --title '[x]' --fill", "gh pr create --title \"{x}\" --fill", "gh pr create --title \\[x --fill"])
+
+    def test_the_stand_in_gh_shows_the_flags_bash_builds(self):
+        # the claim behind the differential below: with `gh` a function that prints its argv, bash's argv holds the quiet flag for each finding
+        for cmd, flag in (("gh pr create --web<f", "--web"), ("gh pr create --title t --web</dev/null", "--web"), ('W=--web; gh pr create -t "$@" -b "$W"', "--web"),
+                          ("HOME=--web; gh pr create ~", "--web"), ("gh pr create --title \"$(case a in a) echo '\"' ;; esac)\" --web #'", "--web")):
+            with self.subTest(cmd=cmd):
+                self.assertIn(flag, bash_argv(cmd))
+
+    def test_bash_agrees_with_the_whitelist_on_generated_commands(self):
+        count = int(os.environ.get("PTN_DIFF_COUNT", "30000"))
+        generated, trusted, ran, hits = run_differential(self.m, 20260101, count)
+        self.assertEqual(generated, count)
+        self.assertGreater(trusted, count // 10)        # the generator does reach the trusted shapes
+        self.assertGreater(ran, trusted // 2)
+        self.assertEqual(hits, [])
+
+    def test_bash_agrees_with_the_whitelist_on_every_short_string(self):
+        length = int(os.environ.get("PTN_EXH_LEN", "4"))
+        strings, trusted, ran, hits = run_exhaustive(self.m, length)
+        self.assertEqual(strings, sum(len(TOKENS) ** n for n in range(1, length + 1)))
+        self.assertGreater(trusted, 0)
+        self.assertEqual(hits, [])
 
 
 class PickingRules(unittest.TestCase):
@@ -756,7 +1094,7 @@ class Shapes(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 segs = self.m.shape_of(cmd)
                 self.assertIsNotNone(segs)
-                self.assertEqual([t for _s, t, _b, _o, _c in segs], want)
+                self.assertEqual([t for _s, t, _b, _c in segs], want)
 
     def test_what_is_not_modeled_is_none(self):
         for cmd in ("a || b", "a & b", "a &", "a |& b", "a ;; b", "(a)", "a)", "((1))", "$((1))", "$'a'", '$"a"', "$[1]", "${a:-b}", "${a",
@@ -764,66 +1102,6 @@ class Shapes(unittest.TestCase):
                     "cat <<EOF\nnever ends", "echo $(a $'b')", 'echo "$((1))"', 'echo "${a b}"', "echo `a $'b'`"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.m.shape_of(cmd))
-
-    def test_the_stdout_of_a_segment_is_told_from_its_stderr(self):
-        for cmd, out in (("a > f", True), ("a >> f", True), ("a 1> f", True), ("a >&2", True), ("a &> f", True), ("a >| f", True), ("a3> f", True),
-                         ("a 2> f", False), ("a 2>> f", False), ("a 2>&1", False), ("a < f", False), ("a <&3", False), ("a 'x > y'", False)):
-            with self.subTest(cmd=cmd):
-                self.assertEqual(self.m.shape_of(cmd)[0][3], out)
-
-    def test_what_is_modeled_keeps_the_shape_of_what_the_old_line_scanner_cut(self):
-        cases = [("echo a#b; z", ["echo a#b", "z"]),
-                 ("cat <<EOF\nbody; | gh pr create\nEOF\nnext", ["cat <<EOF", "next"]),
-                 ("cat <<-'EOF'\n\tbody\n\tEOF\nnext", ["cat <<-'EOF'", "next"]),
-                 ('x "$(a; "b c" )" y; z', ['x "$(a; "b c" )" y', "z"]),
-                 ("a \\\n b; c", ["a  b", "c"]),
-                 ("x \\\n# a comment after a continuation\ny", ["x", "y"]),
-                 ("a\\ #b; c", ["a\\ #b", "c"]),
-                 ("echo URL <<EOF; gh pr create\nEOF", ["echo URL <<EOF", "gh pr create"]),
-                 ("echo URL <<EOF&&gh pr create --fill\nbody\nEOF", ["echo URL <<EOF", "gh pr create --fill"])]
-        for cmd, want in cases:
-            with self.subTest(cmd=cmd):
-                segs = self.m.shape_of(cmd)
-                self.assertIsNotNone(segs)
-                self.assertEqual([t for _s, t, _b, _o, _c in segs], want)
-
-    def test_unclosed_quotes_and_substitutions_do_not_hang_or_raise(self):
-        for cmd in ("echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "cat <<EOF\nnever ends", "echo \\", "cat <<", "echo \\\n", "\\\n"):
-            with self.subTest(cmd=cmd):
-                segs = self.m.shape_of(cmd)
-                self.assertTrue(segs is None or isinstance(segs, list))
-
-    def test_a_heredoc_opener_must_end_its_delimiter_word_and_a_body_must_close_exactly(self):
-        for cmd in ("a <<EOF#x\nEOF", "a <<EOF/x\nEOF", "a <<EOF:\nEOF", "a <<EOF,\nEOF", "a <<EOF$x\nEOF", 'a <<EOF"x"\nEOF', "a <<'EOF'x\nEOF",
-                    'a <<"EOF"x\nEOF', "a <<\\EOF#x\nEOF", "a <<EOF\r\nEOF\r", "a <<EOF\n EOF", "a <<EOF\nEOF ", "a <<EOF\n\tEOF", "a <<'EOF'\n\tEOF",
-                    "a <<-EOF\n EOF", "a <<-EOF\n\t EOF", "a <<EOF\nab\\\nEOF", 'a <<"E\\x"\nE\\x'):
-            with self.subTest(cmd=cmd):
-                self.assertIsNone(self.m.shape_of(cmd))
-        for cmd in ("a <<EOF\nEOF", "a <<EOF\nx EOF\nEOF\nb", "a <<-EOF\n\t\tEOF", "a <<EOF;b\nEOF", "a <<'EOF'\nab\\\nEOF", "a <<EOF\nab\\\\\nEOF",
-                    "a <<EOF>f\nEOF", "a <<EOF<f\nEOF", "a <<EOF|b\nEOF", "a <<EOF&&b\nEOF"):
-            with self.subTest(cmd=cmd):
-                self.assertIsNotNone(self.m.shape_of(cmd))
-
-    def test_a_backslash_newline_needs_a_blank_before_it(self):
-        for cmd in ("a|\\\n| b", "a\\\nb", "a;\\\n;", "a&&\\\nb", "$\\\n'x'", '"a\\\nb"', '"$\\\n(x)"', "`\\\nx`", "$(\\\nx)", "a \\\\\\\nb", "a\\ \\\nb"):
-            with self.subTest(cmd=cmd):
-                self.assertIsNone(self.m.shape_of(cmd))
-        for cmd in ("a \\\nb", "a\t\\\nb", "\\\na", "a\n\\\nb", "a \\\\ \\\nb", '"a \\\nb"', "$(a \\\nb)", "a \\\n#c\nb"):
-            with self.subTest(cmd=cmd):
-                self.assertIsNotNone(self.m.shape_of(cmd))
-
-    def test_a_hash_starts_a_comment_only_at_the_start_of_a_word(self):
-        for cmd, want in (("a #b; c", ["a"]), ("a\t#b; c", ["a"]), ("a;#b\nc", ["a", "c"]), ("a#b; c", ["a#b", "c"]), ("a\\ #b; c", ["a\\ #b", "c"]),
-                          ("a'x'#b; c", ["a'x'#b", "c"]), ("a$(b)#c; d", ["a$(b)#c", "d"]), ("a \\\n#b; c", ["a"]), ("a\r#b; c", ["a\r#b", "c"])):
-            with self.subTest(cmd=cmd):
-                self.assertEqual([t for _s, t, _b, _o, _c in self.m.shape_of(cmd)], want)
-
-    def test_the_stdout_of_a_segment_is_told_from_its_stderr_by_whole_words(self):
-        for cmd, out in (("a x2> f", True), ("a 22> f", True), ("a 2x> f", True), ("a $2> f", True), ("a '2'> f", True), ("a \\2> f", True),
-                         ('a "x"2> f', True), ("a\t2> f", False), ("2> f", False), ("echo 2> f", False), ("a \\\n2> f", False), ("a 2>&1 > f", True),
-                         ("a > f 2>&1", True), ("a 2>&1", False)):
-            with self.subTest(cmd=cmd):
-                self.assertEqual(self.m.shape_of(cmd)[0][3], out)
 
     def test_the_commands_allowed_before_the_create_are_pinned(self):
         # a command word added here is a command the hook trusts to leave the create's output alone: a change to the list is a decision
@@ -839,7 +1117,7 @@ class Shapes(unittest.TestCase):
         # a backslash inside double quotes stays in the word: `"--w\eb"` is not `--web`
         for cmd in ('gh pr create "--w\\eb"', "gh pr create --title '--web'", 'gh pr create --title "a --web b"', "gh pr create --title=--web",
                     "gh pr create --body-file - <<'EOF'\n--web\nEOF", "gh pr create -t '-w' -b \"-h\"", "gh pr create -B main -H feature --label bug", "gh pr create -R 2>&1 x/y --fill", "gh.exe pr create --fill", "A=1 gh.exe issue new --title 'a'",
-                    "gh pr create --fill 2>/dev/null --title 'a' < body.md", 'gh pr create -t 2>/dev/null "--web"',
+                    "gh pr create --fill 2>/dev/null --title 'a'", 'gh pr create -t 2>/dev/null "--web"',
                     'gh pr create -B 2>&1 "$B" --fill',
 
                     'gh pr create --title "x $Y" --fill', 'gh pr create -t "$T" --body "$(cat <<\'EOF\'\nb\nEOF\n)"', "gh pr create --fill"):

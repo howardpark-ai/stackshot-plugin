@@ -39,12 +39,16 @@ prints hookSpecificOutput.additionalContext and exits 0. Two legs:
    `test`, `[`, `export`, or only `NAME=value` words) joined by `&&`, `;`, `|` or a newline, then ONE `gh pr create` or
    `gh issue create` as the last command (any `NAME=value` words and `-R x` before it; `--body-file - <<'EOF'` and `$(cat <<'EOF'...)`
    bodies, `2>&1` and backslash continuations allowed), with no `--web`, `-w`, `--dry-run` or help flag (read after quotes and escapes
-   are removed, so `"--web"` and `--we\b` count) and no redirection of its stdout, and
-   the LAST non-empty line of STDOUT is exactly the URL. The quiet-flag rule covers literal flags, and an expansion in a flag position
-   makes the call untrusted: `$name`, `${name}`, `$(...)`, a backtick, a `{a,b}` list, a glob character (`*?[`) or a double-quoted word that
-   holds one, anywhere outside the value of `--title`/`-t`, `--body`/`-b`, `--body-file`/`-F`, `--repo`/`-R`, `--base`/`-B`, `--head`/`-H`,
-   `--label`/`-l` and `--assignee`/`-a` (the next word, or the rest of the same word), because the shell can build `--web` from them. A
-   value may hold `$name`, `$(...)` and backticks inside double quotes; unquoted they could split into a flag. Anything the scanner does not fully model makes the whole command untrusted: a
+   are removed, so `"--web"` and `--we\b` count), and
+   the LAST non-empty line of STDOUT is exactly the URL. The create's own words are a small whitelist (`words_are_literal`): outside
+   single quotes a word holds only plain characters, escapes and quoted parts, and none of `< > ( ) ; & | ~ * ? [ ] { } !`, a backtick,
+   `$@`, `$*`, `case` or a NUL stands there. The only redirections are the whole words `2>&1`, `2>/dev/null` and a `<<'WORD'` opener. An expansion
+   (`$name`, `$(...)`) may stand only inside DOUBLE quotes, in the value of `--title`/`-t`, `--body`/`-b`, `--body-file`/`-F`, `--repo`/`-R`,
+   `--base`/`-B`, `--head`/`-H`, `--label`/`-l` or `--assignee`/`-a` (the next word, or the rest of the same word), where it can never
+   become a flag; `$(...)` there only as the whole of a `"$(cat <<'WORD' ... WORD)"` value. `#` comments are modeled (they end the line,
+   and a trailing one does not untrust the create). Refused, so, although real: a redirect of the create's input or output, `~`, a glob or
+   brace list, `$name` outside a value, `$(...)` or a backtick that is not the heredoc body, `$@`/`$*`, `!`, a `$(...)` that holds the word
+   `case`. Anything the scanner does not fully model makes the whole command untrusted: a
    `||` or a lone `&` outside quotes, heredoc bodies and `$(...)`, a `<<` that is not a well-formed heredoc opener (its delimiter word must
    end at a blank, a newline, `;`, `&`, `|`, `)`, `<` or `>`, and the closing line must be exactly the delimiter, tabs dropped only for
    `<<-`), an unquoted heredoc body with a line ending in a backslash, a backslash-newline with no blank before it (bash deletes the pair,
@@ -159,7 +163,10 @@ QUIET_WORD = re.compile(r"(?:--web|--dry-run|--help|-[A-Za-z]*[wh][A-Za-z]*)(?:=
 # backticks inside double quotes, because it can never become a flag of its own.
 VALUE_FLAGS = frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H", "--label", "-l",
                          "--assignee", "-a"))
-REDIRECT = re.compile(r"(?:\d*|&)(?:>>|>\||>&|>|<<<|<<-?|<&|<)")        # a word that opens a redirection: not an argument of the command
+FORBIDDEN = frozenset("<>~[]{}!")                    # plain characters that may not stand unquoted in the create's words (`*?` are read as expansions; `;&|()` cannot stand: they end the segment or fail)
+REDIRECT_WORDS = frozenset(("2>&1", "2>/dev/null"))   # the redirections of the create that are whole words of their own
+HEREDOC_WORD = re.compile(r"<<'[A-Za-z_]\w*'")
+ASSIGN_HEAD = re.compile(r"[A-Za-z_]\w*=")
 ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=")      # `-t"$T"` is not here: an empty `$T` leaves `-t` to take the next word
 STDOUT_OP = re.compile(r">>|>\||>&|>")
 BRACE_VAR = re.compile(r"\$\{\w+\}")
@@ -186,7 +193,7 @@ def odd_backslashes(line):
 
 
 def shape_of(cmd):
-    """The top-level segments of `cmd` as (separator before it, text, text with quoted parts blanked, whether it redirects its stdout), or
+    """The top-level segments of `cmd` as (separator before it, text, text with quoted parts blanked, chunks), or
     None when the command holds anything this scanner does not fully model: it must read the line the way bash does, because the hook
     never sees the exit status of what it reads. Models: quotes, `\\` escapes, `$(...)` and backticks (their insides are scanned too),
     ``, heredocs (`<<`, `<<-`, a quoted or bare delimiter word that ends right there; a body runs to a line that is exactly the delimiter,
@@ -194,7 +201,8 @@ def shape_of(cmd):
     newline at the top level. Anything else of the shell's syntax is None: `||`, a lone `&`, `|&`, `;;`, `(`, `((`, `$((`, `$'`, `$"`,
     `$[`, `<(`, `>(`, a `<<` that opens no heredoc or whose delimiter word goes on past what is modeled, an unquoted heredoc body that
     ends a line in a backslash, a backslash-newline with no blank before it, an unclosed quote, substitution or heredoc, and a command
-    longer than MAX_COMMAND characters."""
+    longer than MAX_COMMAND characters, and a bare `case` word inside `$(...)` or backticks (its patterns' `)` would end the substitution
+    early)."""
     if len(cmd) > MAX_COMMAND or "\x00" in cmd:
         return None
     segs = []
@@ -207,18 +215,27 @@ def shape_of(cmd):
         n = len(src)
         top = mode == "top"
         cur, blank, pend = [], [], []
-        st = {"sep": "", "out": False, "fd2": False}
+        st = {"sep": "", "word": ""}              # `word`: the plain characters of the word being read ("\0" once anything else is in it)
         chunks = []                                # (chunk, kind) of the current segment: kinds lit, esc, sq, dq, exp (an expansion or a glob/brace character), sep
 
+        def word_ends():
+            if not top and st["word"] == "case":
+                fail()                             # a `case` pattern's `)` would end the substitution early: not modeled
+            st["word"] = ""
+
         def end(sep):
+            word_ends()
             text = "".join(ch for ch in cur if ch != "\\\n").strip()          # a backslash-newline is deleted, as bash deletes it
             if top and text:
-                segs.append((st["sep"], text, " ".join("".join(blank).split()), st["out"], tuple(chunks)))
+                segs.append((st["sep"], text, " ".join("".join(blank).split()), tuple(chunks)))
             cur.clear(); blank.clear(); chunks.clear()
-            st["sep"], st["out"], st["fd2"] = sep, False, False
+            st["sep"] = sep
 
         def put(chunk, b="Q", kind="lit"):
-            st["fd2"] = chunk == "2" and (not cur or cur[-1] in (" ", "\t", "\\\n"))      # a `2` that is a word of its own
+            if kind == "sep" or (kind == "lit" and chunk[0] in "<>|&;()"):
+                word_ends()                        # a blank or an operator ends the word before it
+            else:
+                st["word"] = st["word"] + chunk if kind == "lit" and len(chunk) == 1 else "\0"
             cur.append(chunk); blank.append(b); chunks.append((chunk, kind))
 
         while i < n and not bad:
@@ -311,14 +328,11 @@ def shape_of(cmd):
                 if src.startswith(">(", i):
                     fail(); break
                 m = STDOUT_OP.match(src, i)
-                if not st["fd2"]:
-                    st["out"] = True                  # a redirection of stdout (`2>` alone is the stderr of the command)
                 put(m.group(0), m.group(0)); i = m.end()
             elif c == "&":
                 if src.startswith("&&", i):
                     end("&&"); i += 2
                 elif src.startswith("&>", i):
-                    st["out"] = True
                     put("&>", "&>"); i += 2
                 else:
                     if top:
@@ -339,6 +353,7 @@ def shape_of(cmd):
                 fail(); break
             elif c == ")":
                 if mode == "sub" and not pend:
+                    word_ends()
                     return i + 1
                 fail(); break
             elif c == "\n":
@@ -357,7 +372,7 @@ def shape_of(cmd):
                     if not found:
                         fail(); break
             else:
-                put(c, c, "sep" if c in " \t" else "exp" if c in "*?[{" else "lit"); i += 1
+                put(c, c, "sep" if c in " \t" else "exp" if c in "*?" else "lit"); i += 1
         end("")
         if mode == "sub" or pend:
             fail()                                    # a `$(` never closed, or a heredoc whose body never ended
@@ -368,28 +383,42 @@ def shape_of(cmd):
 
 
 def word_value(word):
-    """What bash makes of a word that holds no expansion: quotes and escapes removed. An expansion stands as a NUL."""
+    """What bash makes of a word of plain, quoted and escaped parts (it holds no expansion): quotes and escapes removed."""
     out = []
     for chunk, kind in word:
-        if kind == "esc":
-            out.append(chunk[1:])
-        elif kind == "sq":
-            out.append(chunk[1:-1])
-        elif kind == "dq":
-            out.append("\x00" if "$" in chunk or "`" in chunk else chunk[1:-1])
-        elif kind == "exp":
-            out.append("\x00")
-        else:
-            out.append(chunk)
+        out.append(chunk[1:] if kind == "esc" else chunk[1:-1] if kind in ("sq", "dq") else chunk)
     return "".join(out)
 
 
+def heredoc_value(chunk):
+    """Whether a double-quoted chunk is exactly `"$(cat <<'WORD'` + a body + `WORD` + `)"`, the body closed by the first line that is WORD."""
+    m = re.fullmatch(r"\"\$\(cat <<'([A-Za-z_]\w*)'\n(.*)\)\"", chunk, re.S)
+    if not m:
+        return False
+    lines = m.group(2).split("\n")
+    return len(lines) >= 2 and lines[-1] == "" and lines[-2] == m.group(1) and m.group(1) not in lines[:-2]
+
+
+def dq_ok(chunk, value):
+    """Whether a double-quoted chunk of the create command may stand. `value` is whether it is the value of a flag that takes one, the only
+    place `$name` and the `cat` heredoc substitution may be; a backtick, `$(` of any other shape and `$@` / `$*` (which can vanish
+    from the word list) may stand nowhere."""
+    if heredoc_value(chunk):
+        return value
+    inner = chunk[1:-1]
+    if "`" in inner or "$(" in inner or re.search(r"\$[@*]", inner):
+        return False
+    return value or "$" not in inner
+
+
 def words_are_literal(chunks):
-    """Whether the words of the create command (the chunks of its segment) are exactly what they read as: no `--web`, `-w`, `--dry-run` or
-    help flag in any quoting, and no expansion that could form one. An expansion outside single quotes (`$name`, `${name}`, `$(…)`, a
-    backtick, a `{a,b}` list, a glob character, or a double-quoted word that holds one) makes a word of unknown value, so the call is
-    untrusted, unless the word is the value of a flag that takes one (VALUE_FLAGS: the next word or the rest of the same word), where
-    only a double-quoted `$name`, `$(…)` or backtick may stand."""
+    """Whether the words of the create command (the chunks of its segment) are boring enough to be read exactly: nothing in them that
+    the shell expands, splits or redirects, and no `--web`, `-w`, `--dry-run` or help flag after quotes and escapes are removed.
+    Outside single quotes a word holds only plain characters (not `< > ~ [ ] { } !`), escapes and quoted parts; an expansion (`$name`, `${…}`,
+    `$(…)`, a backtick, a brace list, a glob character) is untrusted wherever it stands except inside DOUBLE quotes in the value of a
+    flag that takes one (VALUE_FLAGS: the next word, or the rest of a `--title=…` word): there `$name` and `${name}` may stand, and a
+    `$(cat <<'WORD' … WORD)` substitution as the whole of the value. Words before `gh` are `NAME=value` words. The only redirections
+    are the whole words `2>&1`, `2>/dev/null` and a `<<'WORD'` opener, none of which is an argument."""
     words, cur = [], []
     for chunk in chunks:
         if chunk[1] == "sep":
@@ -400,45 +429,43 @@ def words_are_literal(chunks):
             cur.append(chunk)
     if cur:
         words.append(cur)
-    k = 0
-    while k < len(words) and word_value(words[k]) not in ("gh", "gh.exe"):
-        k += 1                                        # `NAME=value` words before the command are its environment: no flags there
-    if k == len(words):
-        return False
-    value_next = skip_target = False
-    for w in words[k + 1:]:
-        kinds = {kd for _c, kd in w}
-        if skip_target:
-            skip_target = False
-            if "exp" in kinds:
-                return False
-            continue
-        lead = []
+
+    def parts_ok(w, value):                           # `value`: whether `w` is (the tail of) the value of a flag that takes one
         for c, kd in w:
-            if kd != "lit":
-                break
-            lead.append(c)
-        r = REDIRECT.match("".join(lead))
-        if r:                                         # `2>/dev/null` stands between a flag and its value without being the value
-            if "exp" in kinds:
-                return False
-            skip_target = r.end() == len("".join(c for c, _k in w))      # a bare `>` or `<`: the next word is its target
-            continue
+            if kd == "lit":
+                if len(c) != 1 or c in FORBIDDEN:
+                    return False
+            elif kd == "dq":
+                if not dq_ok(c, value):
+                    return False
+            elif kd not in ("esc", "sq"):
+                return False                          # an expansion or a glob character
+        return True
+
+    for k, w in enumerate(words):
+        text = "".join(c for c, _k in w)              # the word as written, quotes and backslashes in: `"gh"` and `g\\h` are not `gh`
+        if text in ("gh", "gh.exe"):
+            break
+        if not ASSIGN_HEAD.match(text) or not parts_ok(w, True):
+            return False                              # not a `NAME=value` word
+    else:
+        return False
+    value_next = False
+    for w in words[k + 1:]:
+        text = "".join(c for c, _k in w)
+        if text in REDIRECT_WORDS or HEREDOC_WORD.fullmatch(text):
+            continue                                  # a redirection is no argument, and leaves a flag still waiting for its value
         if value_next:
             value_next = False
-            if "exp" in kinds or (kinds <= {"lit", "esc"} and QUIET_WORD.fullmatch(word_value(w))):
+            if not parts_ok(w, True) or (all(kd in ("lit", "esc") for _c, kd in w) and QUIET_WORD.fullmatch(word_value(w))):
                 return False
             continue
-        if "exp" in kinds or any(kd == "dq" and ("$" in c or "`" in c) for c, kd in w):
-            head = ""
-            for c, kd in w:
-                if kd != "lit" or len(c) != 1:
-                    break
-                head += c
-            m = ATTACHED.match(head)
-            if not m or any(kd == "exp" for _c, kd in w[len(head):]):
-                return False                          # an expansion in a flag position
+        if ATTACHED.match(text):
+            if not parts_ok(w, True):
+                return False
             continue
+        if not parts_ok(w, False):
+            return False
         v = word_value(w)
         if QUIET_WORD.fullmatch(v):
             return False
@@ -454,11 +481,11 @@ def trusted_create(cmd):
         return None                                   # `$(` nested deeper than the interpreter allows: not modeled
     if not segs:
         return None
-    _sep, _text, blank, redirected, chunks = segs[-1]
-    m = CREATE_SEGMENT.match(blank)                   # on the text with its quoted parts blanked: `A="x gh pr create"` runs no create
-    if not m or redirected or not words_are_literal(chunks):
+    _sep, _text, blank, chunks = segs[-1]
+    m = CREATE_SEGMENT.match(blank)                   # on the text with its quoted parts blanked: `A="x gh pr create"` runs no create (m is None then)
+    if not words_are_literal(chunks):
         return None
-    for _s, _t, b, _o, _c in segs[:-1]:
+    for _s, _t, b, _c in segs[:-1]:
         words = ASSIGNS.sub("", b, count=1).split()
         if words and words[0] not in SAFE_BEFORE:
             return None
