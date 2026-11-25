@@ -38,14 +38,19 @@ prints hookSpecificOutput.additionalContext and exits 0. Two legs:
    shapes it fully models (`trusted_create`): optional plain commands (`cd`, `git`, `echo`, `printf`, `cat`, `true`, `:`, `pwd`, `ls`,
    `test`, `[`, `export`, or only `NAME=value` words) joined by `&&`, `;`, `|` or a newline, then ONE `gh pr create` or
    `gh issue create` as the last command (any `NAME=value` words and `-R x` before it; `--body-file - <<'EOF'` and `$(cat <<'EOF'...)`
-   bodies, `2>&1` and backslash continuations allowed), with no `--web`, `-w`, `--dry-run` or help flag and no redirection of its stdout, and
-   the LAST non-empty line of STDOUT is exactly the URL. Anything the scanner does not fully model makes the whole command untrusted: a
+   bodies, `2>&1` and backslash continuations allowed), with no `--web`, `-w`, `--dry-run` or help flag (read after quotes and escapes
+   are removed, so `"--web"` and `--we\b` count) and no redirection of its stdout, and
+   the LAST non-empty line of STDOUT is exactly the URL. The quiet-flag rule covers literal flags, and an expansion in a flag position
+   makes the call untrusted: `$name`, `${name}`, `$(...)`, a backtick, a `{a,b}` list, a glob character (`*?[`) or a double-quoted word that
+   holds one, anywhere outside the value of `--title`/`-t`, `--body`/`-b`, `--body-file`/`-F`, `--repo`/`-R`, `--base`/`-B`, `--head`/`-H`,
+   `--label`/`-l` and `--assignee`/`-a` (the next word, or the rest of the same word), because the shell can build `--web` from them. A
+   value may hold `$name`, `$(...)` and backticks inside double quotes; unquoted they could split into a flag. Anything the scanner does not fully model makes the whole command untrusted: a
    `||` or a lone `&` outside quotes, heredoc bodies and `$(...)`, a `<<` that is not a well-formed heredoc opener (its delimiter word must
    end at a blank, a newline, `;`, `&`, `|`, `)`, `<` or `>`, and the closing line must be exactly the delimiter, tabs dropped only for
    `<<-`), an unquoted heredoc body with a line ending in a backslash, a backslash-newline with no blank before it (bash deletes the pair,
    so what is on both sides would merge into one token), `$'...'`, `$((`, `((`,
    `[[`, `<(`, `{ }` groups, a subshell, a function definition, `case`, `exit`, `eval` and any other command word not listed above,
-   an unclosed quote, substitution or heredoc, a command longer than 200,000 characters and `$(` nested past the interpreter's
+   an unclosed quote, substitution or heredoc, a NUL byte, a command longer than 200,000 characters and `$(` nested past the interpreter's
    recursion limit. For a GitHub connector call: the result holds
    exactly one distinct pull request or issue URL. Anything else (a URL met in other output, a command that only mentions
    `gh pr create`) gets the older note and "the hook could not tell from the call's shape or output that the link came from the create call itself".
@@ -149,7 +154,13 @@ def gh_created_url(cmd, out):
 # the create or rewire its output), and a word list is the whole allowlist: any other command word makes the command untrusted.
 SAFE_BEFORE = frozenset(("cd", "git", "echo", "printf", "cat", "true", ":", "pwd", "ls", "test", "[", "export"))
 ASSIGNS = re.compile(r"(?:[A-Za-z_]\w*=\S*(?:\s+|$))*")
-QUIET_FLAG = re.compile(r"(?<!\S)(?:--web|--dry-run|--help|-[A-Za-z]*[wh][A-Za-z]*)(?=[\s=]|$)")   # a create that prints no URL
+QUIET_WORD = re.compile(r"(?:--web|--dry-run|--help|-[A-Za-z]*[wh][A-Za-z]*)(?:=.*)?", re.S)   # a word that makes a create print no URL
+# The flags of `gh pr|issue create` whose value is the next word (or the rest of the same word): a value may hold `$name`, `$( )` and
+# backticks inside double quotes, because it can never become a flag of its own.
+VALUE_FLAGS = frozenset(("--title", "-t", "--body", "-b", "--body-file", "-F", "--repo", "-R", "--base", "-B", "--head", "-H", "--label", "-l",
+                         "--assignee", "-a"))
+REDIRECT = re.compile(r"(?:\d*|&)(?:>>|>\||>&|>|<<<|<<-?|<&|<)")        # a word that opens a redirection: not an argument of the command
+ATTACHED = re.compile(r"--(?:title|body|body-file|repo|base|head|label|assignee)=")      # `-t"$T"` is not here: an empty `$T` leaves `-t` to take the next word
 STDOUT_OP = re.compile(r">>|>\||>&|>")
 BRACE_VAR = re.compile(r"\$\{\w+\}")
 BLANKS = " \t\n"
@@ -184,7 +195,7 @@ def shape_of(cmd):
     `$[`, `<(`, `>(`, a `<<` that opens no heredoc or whose delimiter word goes on past what is modeled, an unquoted heredoc body that
     ends a line in a backslash, a backslash-newline with no blank before it, an unclosed quote, substitution or heredoc, and a command
     longer than MAX_COMMAND characters."""
-    if len(cmd) > MAX_COMMAND:
+    if len(cmd) > MAX_COMMAND or "\x00" in cmd:
         return None
     segs = []
     bad = []
@@ -197,17 +208,18 @@ def shape_of(cmd):
         top = mode == "top"
         cur, blank, pend = [], [], []
         st = {"sep": "", "out": False, "fd2": False}
+        chunks = []                                # (chunk, kind) of the current segment: kinds lit, esc, sq, dq, exp (an expansion or a glob/brace character), sep
 
         def end(sep):
             text = "".join(ch for ch in cur if ch != "\\\n").strip()          # a backslash-newline is deleted, as bash deletes it
             if top and text:
-                segs.append((st["sep"], text, " ".join("".join(blank).split()), st["out"]))
-            cur.clear(); blank.clear()
+                segs.append((st["sep"], text, " ".join("".join(blank).split()), st["out"], tuple(chunks)))
+            cur.clear(); blank.clear(); chunks.clear()
             st["sep"], st["out"], st["fd2"] = sep, False, False
 
-        def put(chunk, b="Q"):
+        def put(chunk, b="Q", kind="lit"):
             st["fd2"] = chunk == "2" and (not cur or cur[-1] in (" ", "\t", "\\\n"))      # a `2` that is a word of its own
-            cur.append(chunk); blank.append(b)
+            cur.append(chunk); blank.append(b); chunks.append((chunk, kind))
 
         while i < n and not bad:
             c = src[i]
@@ -215,15 +227,15 @@ def shape_of(cmd):
                 if src.startswith("\\\n", i):
                     if not blank_before(src, i, top):
                         fail(); break
-                    put("\\\n", " ")
+                    put("\\\n", " ", "sep")
                 else:
-                    put(src[i:i + 2])
+                    put(src[i:i + 2], "Q", "esc")
                 i += 2
             elif c == "'":
                 j = src.find("'", i + 1)
                 if j < 0:
                     fail(); break
-                put(src[i:j + 1]); i = j + 1
+                put(src[i:j + 1], "Q", "sq"); i = j + 1
             elif c == '"':
                 j = i + 1
                 while j < n and src[j] != '"':
@@ -251,26 +263,26 @@ def shape_of(cmd):
                     break
                 if j >= n:
                     fail(); break
-                put(src[i:j + 1]); i = j + 1
+                put(src[i:j + 1], "Q", "dq"); i = j + 1
             elif c == "`":
                 k = src.find("`", i + 1)
                 if k < 0:
                     fail(); break
                 walk(src[i + 1:k], 0, "tick")
-                put(src[i:k + 1]); i = k + 1
+                put(src[i:k + 1], "Q", "exp"); i = k + 1
             elif c == "$":
                 if src.startswith("$((", i) or src.startswith("$'", i) or src.startswith('$"', i) or src.startswith("$[", i):
                     fail(); break
                 if src.startswith("$(", i):
                     j = walk(src, i + 2, "sub")
-                    put(src[i:j]); i = j
+                    put(src[i:j], "Q", "exp"); i = j
                 elif src.startswith("${", i):
                     m = BRACE_VAR.match(src, i)
                     if not m:
                         fail(); break
-                    put(m.group(0)); i = m.end()
+                    put(m.group(0), "Q", "exp"); i = m.end()
                 else:
-                    put(c, c); i += 1
+                    put(c, c, "exp"); i += 1
             elif c == "#" and (not cur or cur[-1] in (" ", "\t", "\\\n")):       # a `#` that starts a word (not after an escaped blank or mid-word)
                 j = src.find("\n", i)
                 i = n if j < 0 else j
@@ -345,7 +357,7 @@ def shape_of(cmd):
                     if not found:
                         fail(); break
             else:
-                put(c, c); i += 1
+                put(c, c, "sep" if c in " \t" else "exp" if c in "*?[{" else "lit"); i += 1
         end("")
         if mode == "sub" or pend:
             fail()                                    # a `$(` never closed, or a heredoc whose body never ended
@@ -353,6 +365,85 @@ def shape_of(cmd):
 
     walk(cmd, 0, "top")
     return None if bad else segs
+
+
+def word_value(word):
+    """What bash makes of a word that holds no expansion: quotes and escapes removed. An expansion stands as a NUL."""
+    out = []
+    for chunk, kind in word:
+        if kind == "esc":
+            out.append(chunk[1:])
+        elif kind == "sq":
+            out.append(chunk[1:-1])
+        elif kind == "dq":
+            out.append("\x00" if "$" in chunk or "`" in chunk else chunk[1:-1])
+        elif kind == "exp":
+            out.append("\x00")
+        else:
+            out.append(chunk)
+    return "".join(out)
+
+
+def words_are_literal(chunks):
+    """Whether the words of the create command (the chunks of its segment) are exactly what they read as: no `--web`, `-w`, `--dry-run` or
+    help flag in any quoting, and no expansion that could form one. An expansion outside single quotes (`$name`, `${name}`, `$(…)`, a
+    backtick, a `{a,b}` list, a glob character, or a double-quoted word that holds one) makes a word of unknown value, so the call is
+    untrusted, unless the word is the value of a flag that takes one (VALUE_FLAGS: the next word or the rest of the same word), where
+    only a double-quoted `$name`, `$(…)` or backtick may stand."""
+    words, cur = [], []
+    for chunk in chunks:
+        if chunk[1] == "sep":
+            if cur:
+                words.append(cur)
+            cur = []
+        else:
+            cur.append(chunk)
+    if cur:
+        words.append(cur)
+    k = 0
+    while k < len(words) and word_value(words[k]) not in ("gh", "gh.exe"):
+        k += 1                                        # `NAME=value` words before the command are its environment: no flags there
+    if k == len(words):
+        return False
+    value_next = skip_target = False
+    for w in words[k + 1:]:
+        kinds = {kd for _c, kd in w}
+        if skip_target:
+            skip_target = False
+            if "exp" in kinds:
+                return False
+            continue
+        lead = []
+        for c, kd in w:
+            if kd != "lit":
+                break
+            lead.append(c)
+        r = REDIRECT.match("".join(lead))
+        if r:                                         # `2>/dev/null` stands between a flag and its value without being the value
+            if "exp" in kinds:
+                return False
+            skip_target = r.end() == len("".join(c for c, _k in w))      # a bare `>` or `<`: the next word is its target
+            continue
+        if value_next:
+            value_next = False
+            if "exp" in kinds or (kinds <= {"lit", "esc"} and QUIET_WORD.fullmatch(word_value(w))):
+                return False
+            continue
+        if "exp" in kinds or any(kd == "dq" and ("$" in c or "`" in c) for c, kd in w):
+            head = ""
+            for c, kd in w:
+                if kd != "lit" or len(c) != 1:
+                    break
+                head += c
+            m = ATTACHED.match(head)
+            if not m or any(kd == "exp" for _c, kd in w[len(head):]):
+                return False                          # an expansion in a flag position
+            continue
+        v = word_value(w)
+        if QUIET_WORD.fullmatch(v):
+            return False
+        value_next = v in VALUE_FLAGS
+    return not value_next
 
 
 def trusted_create(cmd):
@@ -363,11 +454,11 @@ def trusted_create(cmd):
         return None                                   # `$(` nested deeper than the interpreter allows: not modeled
     if not segs:
         return None
-    _sep, _text, blank, redirected = segs[-1]
+    _sep, _text, blank, redirected, chunks = segs[-1]
     m = CREATE_SEGMENT.match(blank)                   # on the text with its quoted parts blanked: `A="x gh pr create"` runs no create
-    if not m or redirected or QUIET_FLAG.search(blank):
+    if not m or redirected or not words_are_literal(chunks):
         return None
-    for _s, _t, b, _o in segs[:-1]:
+    for _s, _t, b, _o, _c in segs[:-1]:
         words = ASSIGNS.sub("", b, count=1).split()
         if words and words[0] not in SAFE_BEFORE:
             return None
@@ -454,10 +545,9 @@ _CHILD = None                          # the client call running now, so the bac
 
 
 def kill_group(p):
-    """End a client call and everything it started (it runs as its own session, so its group is its pid). A call that has already
-    exited and been reaped is left alone: its pid may belong to some other process by now."""
-    if p.poll() is not None:
-        return
+    """End a client call and everything it started (it runs as its own session, so its group is its pid). The group is signalled even
+    when the client itself has exited and been reaped: a process it started can outlive it, and the group id is not reused while any
+    member lives (when none does, the call finds no group and that is all)."""
     try:
         os.killpg(p.pid, signal.SIGKILL)
     except (OSError, ProcessLookupError):

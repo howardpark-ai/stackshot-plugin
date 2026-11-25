@@ -6,12 +6,14 @@ The hook runs as the CLI runs it (hook JSON on stdin). The session's name (BUILD
 (arguments and stdin) are made under a temp home, locked while the test runs and removed after, pass or fail. The only processes started
 are the hook and the stand-in client; nothing is killed, nothing touches the network, tmux or the real home directory. A real call to a
 server is never made: the client is always the stand-in."""
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -605,6 +607,76 @@ class Narrowing(Base):
         self.assertEqual(note, OLDER.format(url=PR) + f" Not anchored automatically: {NOT_FROM_CREATE}.")
         self.assertEqual(self.calls(), [])
 
+    # A quiet flag (`--web`, `-w`, `--dry-run`, `--help`) that the shell only builds at run time: the create prints no link, bash exits 0, and
+    # the last line of stdout is the echoed prefix.
+
+    def test_an_expansion_in_a_flag_position_makes_the_command_untrusted(self):
+        forms = ["W=--web; echo @U@; gh pr create $W", 'W=--web; echo @U@; gh pr create "$W"', "echo @U@; gh pr create {--web,}",
+                 "echo @U@; gh pr create --web$X", "echo @U@; gh pr create $(printf -- --web)", "echo @U@; gh pr create `echo --web`",
+                 "echo @U@; gh pr create -$(echo w)", "echo @U@; gh pr create --fill $W", "echo @U@; gh pr create --fill ${W}",
+                 "echo @U@; gh pr create --fill --w${X}eb", 'echo @U@; gh pr create --fill "-$X"', "echo @U@; gh pr create --fill *",
+                 "echo @U@; gh pr create --fill ?", "echo @U@; gh pr create --fill [w]", "echo @U@; gh pr create -{w,}",
+                 "echo @U@; gh pr create --fill --title $W", "echo @U@; gh pr create --fill --title $(echo x)",
+                 "echo @U@; gh pr create --fill --title {a,b}", "echo @U@; gh pr create --fill --title *", "echo @U@; gh pr create --fill -d$X",
+                 "echo @U@; gh pr create --fill 2>$F", "echo @U@; gh -R $R pr create --fill"]
+        for quiet in ("--web", "--dry-run", "--help"):
+            forms += [f"W={quiet}; echo @U@; gh pr create $W", f'W={quiet}; echo @U@; gh pr create "$W"', f"echo @U@; gh pr create {quiet}$X",
+                      f"echo @U@; gh pr create $(printf -- {quiet})", f"echo @U@; gh pr create `echo {quiet}`"]
+        self.distrusted([f.replace("@U@", EVIL) for f in forms])
+
+    def test_a_quiet_flag_in_any_quoting_makes_the_command_untrusted(self):
+        self.distrusted([f"echo {EVIL}; gh pr create {q}" for q in ('"--web"', "'--web'", '"--dry-run"', "'--help'", "--we\\b", '--"web"', "--w'e'b",
+                                                                   '"-w"', "-\\w", '"--web"=true', "--web=true", "-fw", "-h", '-"h"', "'--we'\"b\"", "--we\\\nb x")])
+        self.distrusted([f"echo {EVIL}; gh pr create --fill --title -w", f"echo {EVIL}; gh pr create --fill -R x/y -h"])
+        # a redirection between a flag and its value is not the value: `-R` takes `-t` here and `"--web"` is a flag of its own
+        self.distrusted([f'echo {EVIL}; gh pr create -R 2>/dev/null -t "--w""eb"', f'echo {EVIL}; gh pr create -R < in.txt -t "--web"',
+                         f'echo {EVIL}; gh pr create -R 2>&1 -t "--web"', f'echo {EVIL}; gh pr create -B 2>>err.log -R "--web"'])
+
+    def test_an_expansion_in_the_value_of_a_flag_that_takes_one_is_trusted(self):
+        # the value of --title and the like can never become a flag of its own; `$( )` and backticks only inside double quotes
+        body = "gh pr create --title \"x $Y\" --body \"$(cat <<'EOF'\nthe body, with --web and $HOME in it\nEOF\n)\""
+        forms = [body, 'gh pr create --title "x $Y" --fill', 'gh pr create --title="x $Y" --fill', 'gh pr create -t "$(git log -1 --format=%s)"',
+                 "gh pr create --fill --body \"`git log -1`\"", 'gh pr create -R "$R" --fill', 'gh -R "$R" pr create --fill', 'gh pr create --base "$B" --head "$H" --fill',
+                 'gh pr create --label "$L" --assignee "$A" --fill', 'gh pr create --body-file "$F" --fill', "gh pr create --fill",
+                 "gh pr create --title 'a $b' --fill", "W=--web gh pr create --fill", 'T="x $Y" gh pr create --fill', 'echo "$X" && gh pr create --fill']
+        for n, command in enumerate(forms):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"x{n}")))
+
+    def test_an_unquoted_expansion_in_a_value_is_untrusted(self):
+        # word splitting can turn it into a flag
+        self.distrusted([f"echo {EVIL}; gh pr create --title $Y --fill", f"echo {EVIL}; gh pr create --fill --body $(cat f)",
+                         f"echo {EVIL}; gh pr create --fill -R $R", f"echo {EVIL}; gh pr create --fill --title=$Y", f"echo {EVIL}; gh pr create --fill -t$Y", f'echo {EVIL}; gh pr create -t"$Y" -B main "--web"', f'echo {EVIL}; gh pr create --fill -R"$Y" "--web"',
+                         f"echo {EVIL}; gh pr create --fill --body `cat f`", f"echo {EVIL}; gh pr create --fill --title x{{a,b}}"])
+
+    def test_bash_agrees_that_each_of_these_ends_in_the_echoed_link_and_not_the_creates(self):
+        # the claim behind the two tests above, run for real with a stand-in `gh` that prints a link unless it is given a quiet flag
+        gh = ('gh(){ local q=0 skip=0 a; for a in "$@"; do if ((skip)); then skip=0; continue; fi; case $a in '
+              '--title|-t|--body|-b|--body-file|-F|--repo|-R|--base|-B|--head|-H|--label|-l|--assignee|-a) skip=1;; '
+              '--title=*|--body=*|--repo=*|-[tbFRBHla]?*) ;; --web|--dry-run|--help|-w|-h) q=1;; esac; done; ((q)) || echo CREATED; }\n')
+        for command in ("W=--web; echo U; gh pr create $W", 'W=--web; echo U; gh pr create "$W"', "echo U; gh pr create {--web,}", "echo U; gh pr create --web$X",
+                        "echo U; gh pr create $(printf -- --web)", "echo U; gh pr create `echo --web`", "echo U; gh pr create -$(echo w)",
+                        "W=--dry-run; echo U; gh pr create $W", "echo U; gh pr create --help$X", 'echo U; gh pr create "--web"'):
+            with self.subTest(command=command):
+                with tempfile.TemporaryDirectory() as d:
+                    r = subprocess.run(["bash", "-c", gh + command], capture_output=True, text=True, cwd=d, timeout=20, env={"PATH": os.environ["PATH"], "HOME": d})
+                self.assertEqual((r.returncode, r.stdout.split()[-1]), (0, "U"), (r.stdout, r.stderr))
+        for command in ('echo U; gh pr create --title "x $Y"', "echo U; gh pr create --fill"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as d:
+                r = subprocess.run(["bash", "-c", gh + command], capture_output=True, text=True, cwd=d, timeout=20, env={"PATH": os.environ["PATH"], "HOME": d})
+                self.assertEqual((r.returncode, r.stdout.split()[-1]), (0, "CREATED"), (r.stdout, r.stderr))
+
+    def test_a_nul_byte_makes_the_command_untrusted(self):
+        self.distrusted([f"echo {EVIL}; gh pr create --fill\x00", f"echo \x00{EVIL}; gh pr create --fill", f"\x00echo {EVIL}; gh pr create --fill",
+                         f"echo {EVIL}; gh pr create --title 'a\x00b' --fill"])
+
+    def test_an_array_assignment_makes_the_command_untrusted(self):
+        self.distrusted([f"x=(a); echo {EVIL}; gh pr create --fill", "x=(a); gh pr create --fill", f"echo {EVIL}; x=(a b)\ngh pr create --fill"])
+
+    def test_a_heredoc_that_is_never_closed_makes_the_command_untrusted(self):
+        # no newline at all after the opener: the body is empty, and where the command ends is not modeled
+        self.distrusted([f"echo {EVIL}; gh pr create --fill <<EOF", f"echo {EVIL}; gh pr create --fill <<'EOF'", f"echo {EVIL}; gh pr create --fill <<-EOF"])
+
 
 class PickingRules(unittest.TestCase):
     """pick_item: a waiting item and an item of another project never count."""
@@ -684,11 +756,11 @@ class Shapes(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 segs = self.m.shape_of(cmd)
                 self.assertIsNotNone(segs)
-                self.assertEqual([t for _s, t, _b, _o in segs], want)
+                self.assertEqual([t for _s, t, _b, _o, _c in segs], want)
 
     def test_what_is_not_modeled_is_none(self):
         for cmd in ("a || b", "a & b", "a &", "a |& b", "a ;; b", "(a)", "a)", "((1))", "$((1))", "$'a'", '$"a"', "$[1]", "${a:-b}", "${a",
-                    "a <(b)", "a >(b)", "a <<", "a << )", "a <<$X", "echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "echo $(a <<EOF)",
+                    "a <(b)", "a >(b)", "a <<", "a << )", "a <<$X", "echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "echo $(a <<EOF)", 'echo "$( (a) )"', 'echo "$(a; (b) )"',
                     "cat <<EOF\nnever ends", "echo $(a $'b')", 'echo "$((1))"', 'echo "${a b}"', "echo `a $'b'`"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.m.shape_of(cmd))
@@ -713,7 +785,7 @@ class Shapes(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 segs = self.m.shape_of(cmd)
                 self.assertIsNotNone(segs)
-                self.assertEqual([t for _s, t, _b, _o in segs], want)
+                self.assertEqual([t for _s, t, _b, _o, _c in segs], want)
 
     def test_unclosed_quotes_and_substitutions_do_not_hang_or_raise(self):
         for cmd in ("echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "cat <<EOF\nnever ends", "echo \\", "cat <<", "echo \\\n", "\\\n"):
@@ -744,7 +816,7 @@ class Shapes(unittest.TestCase):
         for cmd, want in (("a #b; c", ["a"]), ("a\t#b; c", ["a"]), ("a;#b\nc", ["a", "c"]), ("a#b; c", ["a#b", "c"]), ("a\\ #b; c", ["a\\ #b", "c"]),
                           ("a'x'#b; c", ["a'x'#b", "c"]), ("a$(b)#c; d", ["a$(b)#c", "d"]), ("a \\\n#b; c", ["a"]), ("a\r#b; c", ["a\r#b", "c"])):
             with self.subTest(cmd=cmd):
-                self.assertEqual([t for _s, t, _b, _o in self.m.shape_of(cmd)], want)
+                self.assertEqual([t for _s, t, _b, _o, _c in self.m.shape_of(cmd)], want)
 
     def test_the_stdout_of_a_segment_is_told_from_its_stderr_by_whole_words(self):
         for cmd, out in (("a x2> f", True), ("a 22> f", True), ("a 2x> f", True), ("a $2> f", True), ("a '2'> f", True), ("a \\2> f", True),
@@ -762,6 +834,33 @@ class Shapes(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.m.trusted_create(cmd))
         self.assertIsNotNone(self.m.trusted_create('A="a b" gh -R "x y" pr create --title "t" --fill'))
+
+    def test_the_words_of_a_create_are_read_as_bash_reads_them(self):
+        # a backslash inside double quotes stays in the word: `"--w\eb"` is not `--web`
+        for cmd in ('gh pr create "--w\\eb"', "gh pr create --title '--web'", 'gh pr create --title "a --web b"', "gh pr create --title=--web",
+                    "gh pr create --body-file - <<'EOF'\n--web\nEOF", "gh pr create -t '-w' -b \"-h\"", "gh pr create -B main -H feature --label bug", "gh pr create -R 2>&1 x/y --fill", "gh.exe pr create --fill", "A=1 gh.exe issue new --title 'a'",
+                    "gh pr create --fill 2>/dev/null --title 'a' < body.md", 'gh pr create -t 2>/dev/null "--web"',
+                    'gh pr create -B 2>&1 "$B" --fill',
+
+                    'gh pr create --title "x $Y" --fill', 'gh pr create -t "$T" --body "$(cat <<\'EOF\'\nb\nEOF\n)"', "gh pr create --fill"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.m.trusted_create(cmd))
+        for cmd in ("gh pr create $W", 'gh pr create "$W"', "gh pr create {--web,}", "gh pr create --web$X", "gh pr create $(x)", "gh pr create `x`",
+                    "gh pr create -$(echo w)", "gh pr create *", 'gh pr create "--web"', "gh pr create --we\\b", "gh pr create --title", "gh pr create -R",
+                    "gh pr create --fill --title $Y", "gh pr create --fill -d$X", "gh $G pr create --fill", "gh.exe pr create $W", "W=--web gh.exe pr create $W", 'gh pr create -t"$T" --fill',
+                    'gh pr create -R 2>/dev/null -t "--web"', "gh pr create -R < in.txt -t '-w'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.trusted_create(cmd))
+
+    def test_a_nul_byte_is_not_modeled(self):
+        for cmd in ("a\x00b", "\x00", "gh pr create --fill\x00", "echo 'a\x00'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.shape_of(cmd))
+
+    def test_a_paren_and_a_heredoc_that_never_ends_are_not_modeled(self):
+        for cmd in ("x=(a)", "x=(a); gh pr create --fill", "echo (a)", "gh pr create --fill <<EOF", "gh pr create --fill <<-'EOF'", "a <<EOF; b"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.shape_of(cmd))
 
     def test_a_command_longer_than_the_cap_is_not_modeled(self):
         self.assertEqual(self.m.MAX_COMMAND, 200_000)
@@ -1098,7 +1197,7 @@ class Backstops(Base):
 
 
 class KillGroup(unittest.TestCase):
-    """kill_group sends the signal to the call's process group, and only while the call is still the one it started."""
+    """kill_group sends the signal to the call's process group, whether or not the client itself is still running."""
 
     @classmethod
     def setUpClass(cls):
@@ -1118,12 +1217,59 @@ class KillGroup(unittest.TestCase):
             self.m.kill_group(self.Call(None))
         killpg.assert_called_once_with(424242, self.m.signal.SIGKILL)
 
-    def test_a_call_that_has_exited_is_left_alone(self):
-        # its pid may belong to another process by now
+    def test_a_call_whose_leader_has_exited_still_has_its_group_killed(self):
+        # a process it started can outlive it, and the group id is not reused while any member lives
         for code in (0, 1, -9):
             with self.subTest(code=code), mock.patch.object(self.m.os, "killpg") as killpg:
                 self.m.kill_group(self.Call(code))
-            killpg.assert_not_called()
+            killpg.assert_called_once_with(424242, self.m.signal.SIGKILL)
+
+    def test_a_process_that_outlives_its_exited_leader_is_killed(self):
+        """A client that prints, starts a process holding its pipes and exits: the call times out (the pipes stay open) with the leader
+        already reaped, and the process it started must not be left running."""
+        with tempfile.TemporaryDirectory() as d:
+            lock = os.open(d, os.O_RDONLY)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                marker = os.path.join(d, "grandchild-marker")
+                client = os.path.join(d, "client.py")
+                with open(client, "w") as f:
+                    f.write("import subprocess, sys\n"
+                            f"g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)', {marker!r}])\n"
+                            f"open({marker!r} + '.pid', 'w').write(str(g.pid))\n"
+                            "print('printed', flush=True)\n")
+                state = {}
+
+                def stray():                               # only if the call left it: a process of this test (its command line names its own file)
+                    pid = state.get("pid")
+                    if not pid:
+                        return
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            mine = marker.encode() in f.read()
+                    except OSError:
+                        return
+                    if mine:
+                        os.kill(pid, 9)
+                self.addCleanup(stray)
+                t = time.monotonic()
+                code, _out, _err = self.m.call_client(client, [], None, 1.5)
+                self.assertIsNone(code)
+                self.assertLess(time.monotonic() - t, 10)
+                with open(marker + ".pid") as f:
+                    state["pid"] = int(f.read())
+                for _ in range(30):
+                    try:
+                        with open(f"/proc/{state['pid']}/stat") as f:
+                            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                                break
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail("the process the call started outlived it")
+            finally:
+                os.close(lock)
 
     def test_a_group_that_is_gone_is_not_an_error(self):
         with mock.patch.object(self.m.os, "killpg", side_effect=ProcessLookupError):
