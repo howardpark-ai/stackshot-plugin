@@ -494,7 +494,7 @@ class CommandLookup(unittest.TestCase):
     def assert_one_note(self, e, phrase, what):
         lines = e.last_err.splitlines()
         self.assertEqual(len(lines), 1, f"{what}: {lines!r}")
-        self.assertTrue(lines[0].startswith("stackshot-plugin: gbrain-redirect-guard: "), what)
+        self.assertRegex(lines[0], r"^stackshot-plugin: [a-z-]+: the (lookup command|setting gbrain_lookup_command) ", what)
         self.assertIn(phrase, lines[0], what)
         for secret in (G.STUB, "notes/", "pad/", "noise", "lookup-complete", "rows", "banner"):
             self.assertNotIn(secret, lines[0], f"{what}: the note carries {secret!r}")
