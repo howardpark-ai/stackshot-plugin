@@ -26,7 +26,7 @@ PR = "https://github.com/acme/widgets/pull/7"
 ISSUE = "https://github.com/acme/widgets/issues/12"
 NOTE_TAG = "(post-tool-note.py)"
 OLDER = "Created {url}. Anchor it now: stackshot anchors(project=..., add=[{url}]) " + NOTE_TAG + "."
-NOT_FROM_CREATE = "the link did not come from the create call itself"
+NOT_FROM_CREATE = "the hook could not tell from the call's shape or output that the link came from the create call itself"
 OTHER_PR = "https://github.com/acme/widgets/pull/99"
 EVIL = "https://github.com/evil-org/evil-repo/pull/99"        # a link the create call never printed
 
@@ -43,6 +43,11 @@ if args[:2] == ["get", "open-records"]:
     if ctl("sleep.get"):
         with open(out + ".pid", "w") as f:
             f.write(str(os.getpid()))
+        if ctl("grandchild"):                          # a process the client started: it shares the client's process group
+            import subprocess
+            g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", out + ".grandchild"])
+            with open(out + ".gpid", "w") as f:
+                f.write(str(g.pid))
         time.sleep(float(ctl("sleep.get")))
     if ctl("get.rc") not in (None, "0"):
         print(ctl("get.out") or "[401] no token on this machine")
@@ -485,34 +490,120 @@ class Narrowing(Base):
         # the same pull request under several spellings is one URL
         self.assertIn(f"Anchored {PR}", self.run_hook(mcp(f'{{"url": "{PR}", "html_url": "{PR}", "diff_url": "{PR}.diff"}}')))
 
+    # The hook never sees the exit status of what it reads (a failing command fires no PostToolUse hook), so each test below is a command
+    # that bash runs differently from a plain reading of its text, and that ends in a link the create did not print.
 
-class Segments(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.m = load_module("ptn_segments")
+    def test_a_heredoc_delimiter_word_that_goes_on_makes_the_command_untrusted(self):
+        # bash's delimiter is the whole word (`EOF#x`), so the line `EOF` below closes nothing and the create is part of the body
+        tails = ["#x", "/x", ":", ",", "$x", '"x"', "@", "+", "=", "%", "\\\\"]
+        self.distrusted([f"echo {EVIL} <<EOF{t}\nEOF\ngh pr create --fill" for t in tails])
+        self.distrusted([f"printf '%s\\n' {EVIL} <<EOF#x\nEOF\ngh pr create --fill", f"echo {EVIL} <<-EOF#x\n\tEOF\ngh pr create --fill",
+                         f"echo {EVIL} <<\\EOF#x\nEOF\ngh pr create --fill", f"echo {EVIL} <<'EOF'x\nEOF\ngh pr create --fill",
+                         f"echo {EVIL} <<\"EOF\"x\nEOF\ngh pr create --fill", f"echo {EVIL} <<E\"O\"F\nEOF\ngh pr create --fill",
+                         f"echo {EVIL} << EOF#x\nEOF\ngh pr create --fill", f"echo {EVIL} <<\"E\\\\x\"\nE\\\\x\ngh pr create --fill"])
 
-    def test_cuts_and_what_is_never_a_segment(self):
-        cases = [("a && b; c | d\ne", ["a", "b", "c", "d", "e"]),
-                 ('echo "a; b | c" && x', ['echo "a; b | c"', "x"]),
-                 ("echo 'a && b'; y", ["echo 'a && b'", "y"]),
-                 ("x # y; z\nw", ["x", "w"]),
-                 ("echo a#b; z", ["echo a#b", "z"]),
-                 ("cat <<EOF\nbody; | gh pr create\nEOF\nnext", ["cat <<EOF", "next"]),
-                 ("cat <<-'EOF'\n\tbody\n\tEOF\nnext", ["cat <<-'EOF'", "next"]),
-                 ("x $(a; b) y; z", ["x $(a; b) y", "z"]),
-                 ('x "$(a; "b c" )" y; z', ['x "$(a; "b c" )" y', "z"]),
-                 ("x `a; b` y", ["x `a; b` y"]),
-                 ("a \\\n b; c", ["a \\\n b", "c"]),
-                 ("a 2>&1 | b", ["a 2>&1", "b"]),
-                 ("", []), (" ; ;\n", [])]
-        for cmd, want in cases:
-            with self.subTest(cmd=cmd):
-                self.assertEqual(self.m.real_segments(cmd), want)
+    def test_a_heredoc_delimiter_word_that_ends_at_a_metacharacter_is_modeled(self):
+        for n, tail in enumerate([" ", "\n", ";", "&&", "|", " >/dev/null", "<in.txt", " 2>&1"]):
+            with self.subTest(tail=tail):
+                command = f"cat <<EOF{tail}" + ("" if tail == "\n" else "\n") + "body\nEOF\ngh pr create --fill"
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"m{n}")))
 
-    def test_unclosed_quotes_and_substitutions_do_not_hang_or_raise(self):
-        for cmd in ("echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "cat <<EOF\nnever ends", "echo \\", "cat <<"):
-            with self.subTest(cmd=cmd):
-                self.assertIsInstance(self.m.real_segments(cmd), list)
+    def test_a_heredoc_closes_only_on_a_line_that_is_exactly_its_delimiter(self):
+        # a line that is a blank away from the delimiter, or has a carriage return after it, does not close a plain `<<` body
+        self.distrusted([f"echo {EVIL} <<EOF\nbody\n EOF\ngh pr create --fill", f"echo {EVIL} <<EOF\nbody\nEOF \ngh pr create --fill",
+                         f"echo {EVIL} <<EOF\nbody\n\tEOF\ngh pr create --fill", f"echo {EVIL} <<EOF\nbody\nEOF\r\ngh pr create --fill",
+                         f"echo {EVIL} <<'EOF'\nbody\n\tEOF\ngh pr create --fill", f"echo {EVIL} <<-EOF\nbody\n EOF\ngh pr create --fill",
+                         f"echo {EVIL} <<-EOF\nbody\n\t EOF\ngh pr create --fill", f"echo {EVIL} <<-EOF\nbody\nEOF \ngh pr create --fill"])
+
+    def test_a_heredoc_closes_on_its_delimiter_alone_and_on_tabs_only_for_dash(self):
+        forms = ["cat <<EOF\nbody\nEOF\ngh pr create --fill", "cat <<-EOF\n\t\tbody\n\t\tEOF\ngh pr create --fill",
+                 "cat <<-'EOF'\nbody\n\tEOF\ngh pr create --fill", "cat <<'a b'\nbody\na b\ngh pr create --fill",
+                 "cat <<\"EOF\"\nbody\nEOF\ngh pr create --fill", "cat <<\\EOF\nbody\nEOF\ngh pr create --fill",
+                 "cat <<EOF\nEOF\ngh pr create --fill"]
+        for n, command in enumerate(forms):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"c{n}")))
+
+    def test_a_body_line_that_only_holds_the_delimiter_does_not_end_the_heredoc(self):
+        # never closed: the whole create is body text. A scanner that ended the body on a line that contains, starts or ends with the word
+        # would run the create
+        self.distrusted([f"echo {EVIL} <<EOF\nsay EOF now\ngh pr create --fill", f"echo {EVIL} <<EOF\nEOF x\ngh pr create --fill",
+                         f"echo {EVIL} <<EOF\nx EOF\ngh pr create --fill", f"echo {EVIL} <<EOF\nEOFEOF\ngh pr create --fill",
+                         f"echo {EVIL} <<EOF\nEO\ngh pr create --fill"])
+        command = "cat <<EOF\nsay EOF now\nEOF x\nx EOF\nEOF\ngh pr create --fill"
+        self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n")))
+
+    def test_an_unquoted_heredoc_body_joins_a_line_that_ends_in_a_backslash_to_the_next(self):
+        # bash reads `ab\` + `EOF` as the one line `abEOF`: the body goes on, and the create below is only text. Quoting the delimiter turns
+        # that joining off
+        self.distrusted([f"echo {EVIL} <<EOF\nab\\\nEOF\ngh pr create --fill", f"echo {EVIL} <<-EOF\n\tab\\\n\tEOF\ngh pr create --fill",
+                         f"echo {EVIL} <<EOF\nab\\\\\\\nEOF\ngh pr create --fill"])
+        for n, command in enumerate(["cat <<'EOF'\nab\\\nEOF\ngh pr create --fill", "cat <<\\EOF\nab\\\nEOF\ngh pr create --fill",
+                                     "cat <<EOF\nab\\\\\nEOF\ngh pr create --fill"]):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"q{n}")))
+
+    def test_a_backslash_newline_with_no_blank_before_it_makes_the_command_untrusted(self):
+        # bash deletes the pair, so `|` + `|` become `||`, `create` + `#x` one word and `$` + `'` an ANSI-C quote
+        self.distrusted([f"echo {EVIL} |\\\n| gh pr create --fill", "cat url.txt |\\\n| gh pr create", f"gh pr create --fill\\\n#x; echo {EVIL}",
+                         f"gh pr create --fill --title $\\\n'\\'' ; echo {EVIL} ; : \\'", f"echo {EVIL} &\\\n& gh pr create --fill",
+                         f"echo {EVIL} ;\\\n; gh pr create --fill", f"gh pr create --fill\\\n; echo {EVIL}", f"echo {EVIL}; gh pr create --fill --title a\\\nb",
+                         f"gh pr create --fill --title \"a\\\nb\"; echo {EVIL}", f"echo {EVIL}; gh pr create --fill \"$\\\n(echo x)\"",
+                         f"echo {EVIL}; gh pr create --fill \\ \\\n#x", f"echo {EVIL}; gh pr create --fill a\\ \\\n#x; echo {EVIL}",
+                         f"echo {EVIL}; gh pr create \"`\\\n`\""])
+
+    def test_a_backslash_newline_after_a_blank_is_a_continuation(self):
+        forms = ["gh pr create \\\n  --title t \\\n  --body b", "echo a \\\n b; gh pr create --fill", "cd . && \\\n  gh pr create --fill",
+                 "gh pr create --title \"a \\\n b\" --fill", "gh pr create --fill \\\n  # a comment\n", "git push \\\n  -u origin x\ngh pr create --fill",
+                 "gh \\\npr create --fill", "echo a;\n\\\ngh pr create --fill"]
+        for n, command in enumerate(forms):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"b{n}")))
+
+    def test_a_hash_that_does_not_start_a_word_is_not_a_comment(self):
+        # `a#b` and `a\ #b` are one word each: the `; echo` after them runs and is the last command
+        self.distrusted([f"gh pr create --fill a#b; echo {EVIL}", f"gh pr create --fill a\\ #b; echo {EVIL}",
+                         f"gh pr create --fill 'a'#b; echo {EVIL}", f"gh pr create --fill $x#b; echo {EVIL}",
+                         f"gh pr create --fill a$(true)#b; echo {EVIL}", f"gh pr create --fill \"a\"#b; echo {EVIL}"])
+        for n, command in enumerate(["gh pr create --fill --title a#b", "gh pr create --fill # then wait; echo x", "gh pr create --fill\t#c",
+                                     "echo a;#c\ngh pr create --fill"]):
+            with self.subTest(command=command):
+                self.assertIn(f"Anchored {PR} project-wide", self.run_hook(bash_event(command, PR + "\n", session=f"h{n}")))
+
+    def test_a_word_that_ends_in_a_two_is_not_a_stderr_redirection(self):
+        # `x2>f` is the word `x2` and a redirection of stdout; only a `2` that is a word of its own names stderr
+        self.distrusted([f"echo {EVIL}; gh pr create --fill x2>f", f"echo {EVIL}; gh pr create --fill a2>>f", f"echo {EVIL}; gh pr create --fill 22>f",
+                         f"echo {EVIL}; gh pr create --fill $2>f", f"echo {EVIL}; gh pr create --fill '2'>f", f"echo {EVIL}; gh pr create --fill \\2>f",
+                         f"echo {EVIL}; gh pr create --fill \"x\"2>f"])
+
+    def test_a_create_inside_quotes_or_a_substitution_of_an_assignment_is_not_the_create(self):
+        # `A="x gh pr create"` is one assignment word: no command runs, and the words in the quotes are text
+        self.distrusted([f"echo {EVIL}; A=\"x gh pr create --fill\"", f"echo {EVIL}; A='x gh pr create --fill'", f"echo {EVIL}; A=$(x gh pr create --fill)",
+                         f"echo {EVIL}; A=`x gh pr create --fill`", f"echo {EVIL}; A=1' \ngh pr create --fill'", f"echo {EVIL}; A=\\ gh pr create --fill",
+                         f"echo {EVIL}; B=\"a\" A=\"x gh pr create --fill\""])
+
+    def test_the_commands_that_may_come_before_the_create_are_a_closed_list(self):
+        self.distrusted([f"{c} x; gh pr create --fill" for c in ("python3", "sed", "tee", "env", "gh", "sh", "bash", "xargs", "command", "builtin",
+                                                                  "source", ".", "read", "wait", "set", "trap", "unset", "alias", "mapfile")])
+
+    def test_a_command_longer_than_the_cap_is_not_modeled(self):
+        base = "gh pr create --fill --title "
+        for n, (size, trusted) in enumerate(((200_000, True), (200_001, False))):
+            with self.subTest(size=size):
+                command = base + "a" * (size - len(base))
+                note = self.run_hook(bash_event(command, PR + "\n", session=f"l{n}"))
+                if trusted:
+                    self.assertIn(f"Anchored {PR} project-wide", note)
+                else:
+                    self.assertEqual(note, OLDER.format(url=PR) + f" Not anchored automatically: {NOT_FROM_CREATE}.")
+
+    def test_substitutions_nested_past_the_recursion_limit_give_the_older_note_with_a_reason(self):
+        # the scanner recurses into each `$(`: an error there must not end the hook without a note
+        command = "gh pr create --fill --title \"" + "$(echo " * 3000 + ")" * 3000 + "\""
+        self.assertTrue(len(command) < 200_000)
+        note = self.run_hook(bash_event(command, PR + "\n"))
+        self.assertEqual(note, OLDER.format(url=PR) + f" Not anchored automatically: {NOT_FROM_CREATE}.")
+        self.assertEqual(self.calls(), [])
 
 
 class PickingRules(unittest.TestCase):
@@ -608,6 +699,95 @@ class Shapes(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.m.shape_of(cmd)[0][3], out)
 
+    def test_what_is_modeled_keeps_the_shape_of_what_the_old_line_scanner_cut(self):
+        cases = [("echo a#b; z", ["echo a#b", "z"]),
+                 ("cat <<EOF\nbody; | gh pr create\nEOF\nnext", ["cat <<EOF", "next"]),
+                 ("cat <<-'EOF'\n\tbody\n\tEOF\nnext", ["cat <<-'EOF'", "next"]),
+                 ('x "$(a; "b c" )" y; z', ['x "$(a; "b c" )" y', "z"]),
+                 ("a \\\n b; c", ["a  b", "c"]),
+                 ("x \\\n# a comment after a continuation\ny", ["x", "y"]),
+                 ("a\\ #b; c", ["a\\ #b", "c"]),
+                 ("echo URL <<EOF; gh pr create\nEOF", ["echo URL <<EOF", "gh pr create"]),
+                 ("echo URL <<EOF&&gh pr create --fill\nbody\nEOF", ["echo URL <<EOF", "gh pr create --fill"])]
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                segs = self.m.shape_of(cmd)
+                self.assertIsNotNone(segs)
+                self.assertEqual([t for _s, t, _b, _o in segs], want)
+
+    def test_unclosed_quotes_and_substitutions_do_not_hang_or_raise(self):
+        for cmd in ("echo 'abc", 'echo "abc', "echo $(abc", "echo `abc", "cat <<EOF\nnever ends", "echo \\", "cat <<", "echo \\\n", "\\\n"):
+            with self.subTest(cmd=cmd):
+                segs = self.m.shape_of(cmd)
+                self.assertTrue(segs is None or isinstance(segs, list))
+
+    def test_a_heredoc_opener_must_end_its_delimiter_word_and_a_body_must_close_exactly(self):
+        for cmd in ("a <<EOF#x\nEOF", "a <<EOF/x\nEOF", "a <<EOF:\nEOF", "a <<EOF,\nEOF", "a <<EOF$x\nEOF", 'a <<EOF"x"\nEOF', "a <<'EOF'x\nEOF",
+                    'a <<"EOF"x\nEOF', "a <<\\EOF#x\nEOF", "a <<EOF\r\nEOF\r", "a <<EOF\n EOF", "a <<EOF\nEOF ", "a <<EOF\n\tEOF", "a <<'EOF'\n\tEOF",
+                    "a <<-EOF\n EOF", "a <<-EOF\n\t EOF", "a <<EOF\nab\\\nEOF", 'a <<"E\\x"\nE\\x'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.shape_of(cmd))
+        for cmd in ("a <<EOF\nEOF", "a <<EOF\nx EOF\nEOF\nb", "a <<-EOF\n\t\tEOF", "a <<EOF;b\nEOF", "a <<'EOF'\nab\\\nEOF", "a <<EOF\nab\\\\\nEOF",
+                    "a <<EOF>f\nEOF", "a <<EOF<f\nEOF", "a <<EOF|b\nEOF", "a <<EOF&&b\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.m.shape_of(cmd))
+
+    def test_a_backslash_newline_needs_a_blank_before_it(self):
+        for cmd in ("a|\\\n| b", "a\\\nb", "a;\\\n;", "a&&\\\nb", "$\\\n'x'", '"a\\\nb"', '"$\\\n(x)"', "`\\\nx`", "$(\\\nx)", "a \\\\\\\nb", "a\\ \\\nb"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.shape_of(cmd))
+        for cmd in ("a \\\nb", "a\t\\\nb", "\\\na", "a\n\\\nb", "a \\\\ \\\nb", '"a \\\nb"', "$(a \\\nb)", "a \\\n#c\nb"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.m.shape_of(cmd))
+
+    def test_a_hash_starts_a_comment_only_at_the_start_of_a_word(self):
+        for cmd, want in (("a #b; c", ["a"]), ("a\t#b; c", ["a"]), ("a;#b\nc", ["a", "c"]), ("a#b; c", ["a#b", "c"]), ("a\\ #b; c", ["a\\ #b", "c"]),
+                          ("a'x'#b; c", ["a'x'#b", "c"]), ("a$(b)#c; d", ["a$(b)#c", "d"]), ("a \\\n#b; c", ["a"]), ("a\r#b; c", ["a\r#b", "c"])):
+            with self.subTest(cmd=cmd):
+                self.assertEqual([t for _s, t, _b, _o in self.m.shape_of(cmd)], want)
+
+    def test_the_stdout_of_a_segment_is_told_from_its_stderr_by_whole_words(self):
+        for cmd, out in (("a x2> f", True), ("a 22> f", True), ("a 2x> f", True), ("a $2> f", True), ("a '2'> f", True), ("a \\2> f", True),
+                         ('a "x"2> f', True), ("a\t2> f", False), ("2> f", False), ("echo 2> f", False), ("a \\\n2> f", False), ("a 2>&1 > f", True),
+                         ("a > f 2>&1", True), ("a 2>&1", False)):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.m.shape_of(cmd)[0][3], out)
+
+    def test_the_commands_allowed_before_the_create_are_pinned(self):
+        # a command word added here is a command the hook trusts to leave the create's output alone: a change to the list is a decision
+        self.assertEqual(self.m.SAFE_BEFORE, frozenset({"cd", "git", "echo", "printf", "cat", "true", ":", "pwd", "ls", "test", "[", "export"}))
+
+    def test_a_create_is_only_a_create_when_its_words_are_plain(self):
+        for cmd in ('"gh" pr create --fill', "g\\h pr create --fill", "gh 'pr' create --fill", 'A="x gh pr create" --fill'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.m.trusted_create(cmd))
+        self.assertIsNotNone(self.m.trusted_create('A="a b" gh -R "x y" pr create --title "t" --fill'))
+
+    def test_a_command_longer_than_the_cap_is_not_modeled(self):
+        self.assertEqual(self.m.MAX_COMMAND, 200_000)
+        self.assertIsNotNone(self.m.shape_of("a" * self.m.MAX_COMMAND))
+        self.assertIsNone(self.m.shape_of("a" * (self.m.MAX_COMMAND + 1)))
+
+    def test_the_scan_is_linear_in_the_redirections_before_the_create(self):
+        # each `>` used to join the whole segment so far: 50,000 of them took 13 s, past the hook's own 10 s limit
+        for what, cmd in (("redirections", "echo " + "> " * 50_000 + "\ngh pr create --fill"),
+                          ("stdout joins", "echo " + ">" * 50_000 + "\ngh pr create --fill"),
+                          ("stderr joins", "echo " + "2>&1 " * 20_000 + "\ngh pr create --fill"),
+                          ("fd words", "echo " + "2>f " * 30_000 + "\ngh pr create --fill")):
+            with self.subTest(what=what):
+                t = time.monotonic()
+                segs = self.m.shape_of(cmd)
+                took = time.monotonic() - t
+                self.assertIsNotNone(segs)
+                self.assertEqual(segs[-1][1], "gh pr create --fill")
+                self.assertLess(took, 2, took)
+
+    def test_substitutions_nested_past_the_recursion_limit_are_untrusted_not_an_error(self):
+        deep = "gh pr create --fill --title " + "$(echo " * 3000 + ")" * 3000
+        with self.assertRaises(RecursionError):
+            self.m.shape_of(deep)                                      # the scanner itself does not catch it ...
+        self.assertIsNone(self.m.trusted_create(deep))                 # ... the caller that decides what is trusted does
+
 
 class ItemsThatDoNotCount(Base):
     def test_a_waiting_item_gets_a_project_wide_anchor_with_the_reason(self):
@@ -630,6 +810,7 @@ class ItemsThatDoNotCount(Base):
                                f"not tied to a board item. {NOTE_TAG}")
         self.assertEqual(self.posted(), [{"project": PROJECT, "add": [PR], "sender": ME, "items": ["a7"]},
                                          {"project": PROJECT, "add": [PR], "sender": ME}])
+        self.assertNotIn("items", self.posted()[1])                                          # the retried add names no item
         self.assertIn("already anchored", self.run_hook(gh_event(PR)))                     # the marker was written after the retry
 
     def test_another_refusal_is_not_retried(self):
@@ -663,6 +844,7 @@ class ItemsThatDoNotCount(Base):
         note = self.run_hook(gh_event(PR))
         self.assertEqual(note, OLDER.format(url=PR) + " Not anchored automatically: the anchor call failed (stackshot: anchors not added [400] Refused: no project).")
         self.assertEqual(len(self.posted()), 1)
+        self.assertNotIn("items", self.posted()[0])
 
 
 class Markers(Base):
@@ -878,11 +1060,74 @@ class Backstops(Base):
             time.sleep(0.1)
         self.assertFalse(self.alive(pid), "the client call outlived the hook")
 
+    def test_the_alarm_ends_what_the_client_call_started_too(self):
+        """The whole process group goes, not only the client: a grandchild of the call that ignored the alarm would keep the hook's
+        output pipe and the run open."""
+        self.ctl("sleep.get", "25")
+        self.ctl("grandchild", "1")
+        r, took = self.child("real-client-hang", env_extra={"POST_TOOL_NOTE_CALL_TIMEOUT_S": "20"})
+        self.assertEqual(self.one_json_line(r), OLDER.format(url=PR) + " Not anchored automatically: it timed out.")
+        self.assertTrue(took < 8, took)
+        with open(self.out + ".pid") as f:
+            pid = int(f.read())
+        with open(self.out + ".gpid") as f:
+            gpid = int(f.read())
+
+        def stray(p, marker):                          # only if the hook left it: a process of this test (its command line names its own files)
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as f:
+                    mine = marker.encode() in f.read()
+            except OSError:
+                return
+            if mine:
+                os.kill(p, 9)
+        self.addCleanup(stray, pid, self.checkout)
+        self.addCleanup(stray, gpid, self.out + ".grandchild")
+        for _ in range(30):
+            if not self.alive(pid) and not self.alive(gpid):
+                break
+            time.sleep(0.1)
+        self.assertFalse(self.alive(pid), "the client call outlived the hook")
+        self.assertFalse(self.alive(gpid), "a process the client call started outlived the hook")
+
     def test_an_attempt_that_hangs_after_the_add_was_posted_says_it_was_anchored(self):
         r, _ = self.child("hang-after-post")
         note = self.one_json_line(r)
         self.assertEqual(note, f"Anchored {PR} project-wide on {PROJECT} (no open item names you as its mover); not tied to a board item. {NOTE_TAG}")
         self.assertNotIn("Not anchored", note)
+
+
+class KillGroup(unittest.TestCase):
+    """kill_group sends the signal to the call's process group, and only while the call is still the one it started."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module("ptn_kill")
+
+    class Call:
+        pid = 424242
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    def test_a_running_call_has_its_group_killed(self):
+        with mock.patch.object(self.m.os, "killpg") as killpg:
+            self.m.kill_group(self.Call(None))
+        killpg.assert_called_once_with(424242, self.m.signal.SIGKILL)
+
+    def test_a_call_that_has_exited_is_left_alone(self):
+        # its pid may belong to another process by now
+        for code in (0, 1, -9):
+            with self.subTest(code=code), mock.patch.object(self.m.os, "killpg") as killpg:
+                self.m.kill_group(self.Call(code))
+            killpg.assert_not_called()
+
+    def test_a_group_that_is_gone_is_not_an_error(self):
+        with mock.patch.object(self.m.os, "killpg", side_effect=ProcessLookupError):
+            self.m.kill_group(self.Call(None))
 
 
 class OutOfTime(Base):
