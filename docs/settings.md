@@ -64,7 +64,8 @@ Seams that already existed and stay as they were: `GH_REPO`; `BUILD_STOPS_NAME`,
 `stackshot/prompts/`. `no-ask-watch` keeps its own folder, `no-ask-watch/` (`firings.jsonl`, the log of every catch, one JSON line each: `t` in UTC, `pane`,
 `kind`, `sender`, `outcome`; `pending.jsonl`, the posts that failed and wait to be retried; `state.json`, the hourly fold). `python3 hooks/no-ask-watch.py --replay [file]`
 posts the `sent` and `folded` lines of that log (or of another file) to stackshot again; stackshot ignores a record it already has, so it is safe to run twice.
-`post-tool-note` keeps `post-tool-note/anchored.txt`: one hash per (session, URL) it anchored, so a URL is anchored once per session.
+`post-tool-note` keeps `post-tool-note/anchored.txt` (folder mode 0700, file 0600): one hash per (session, URL) it anchored, so a URL is anchored once per session; a line in it that is not a hash is dropped.
+`POST_TOOL_NOTE_CALL_TIMEOUT_S` sets how long `post-tool-note` waits for each of its two calls to stackshot's client (default `3.5` seconds, at least `0.1`; an empty or non-numeric value means the default). The whole attempt has a budget of 7.5 seconds and a backstop alarm at 9 seconds, whatever this says; it is meant for tests.
 
 An example `plugin.json` (replace `prj_<8 hex>` with the project's permanent id, `prj_` and eight hex digits):
 
