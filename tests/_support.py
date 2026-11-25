@@ -104,12 +104,12 @@ def env_for(home, **extra):
     return env
 
 
-def run_hook(name, payload, env, args=(), timeout=30):
-    """Run hooks/<name> with `payload` (a dict, or str) on stdin. Returns (exit code, stdout, stderr)."""
+def run_hook(name, payload, env, args=(), timeout=30, cwd=None):
+    """Run hooks/<name> with `payload` (a dict, or str) on stdin, in `cwd` (default: the temp HOME). Returns (exit code, stdout, stderr)."""
     path = os.path.join(HOOKS, name)
     cmd = (["bash", path] if name.endswith(".sh") else [sys.executable, path]) + list(args)
     data = payload if isinstance(payload, str) else json.dumps(payload)
-    r = subprocess.run(cmd, input=data, capture_output=True, text=True, env=env, timeout=timeout, cwd=env["HOME"])
+    r = subprocess.run(cmd, input=data, capture_output=True, text=True, env=env, timeout=timeout, cwd=cwd or env["HOME"])
     return r.returncode, r.stdout, r.stderr
 
 
