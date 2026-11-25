@@ -95,12 +95,45 @@ The contract:
   reads the variables as `:'rows'` and `:'banner'`, runs in a read-only transaction, selects one row per page found and ends with a
   select of one line, `lookup-complete-<random hex>`, new on every run.
 - **The command** runs the script on the live database with `psql -X -q -A -t -F <tab> -v ON_ERROR_STOP=1`, each entry of `variables` set
-  as `-v name=value`, and prints what `psql` printed to **stdout**, exit status 0. Its stderr is discarded.
-- **Time**: the command gets what is left of `GBRAIN_REDIRECT_BUDGET` (2 s). It runs in its own process group; at the deadline, or when
-  the hook's own timer ends the hook, the whole group is killed, so an `ssh` it started does not outlive the hook.
-- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, or prints rows that are not followed by this
-  run's end line as the last line, tells the guard nothing, and every call goes on. The end line is what separates "the page does not
-  exist" from "the command did not run the script" (an exit 0 with no output): a page counts as new, and the new-page check refuses
-  it, only when the end line shows the query ran to its end and found no row.
+  as `-v name=value`, and prints what `psql` printed to **stdout**, exit status 0, at most 1 MB (the hook stops reading at the cap, ends
+  the command and goes on without a lookup). Its stderr is discarded. It runs in your home folder, never in the project folder.
+- **Every value in `variables` is untrusted text.** `rows` holds page slugs that a model wrote, so a slug can hold a quote, a semicolon
+  or a newline, and a real slug may be non-ASCII, so the hook does not filter them. Never put such a value into a shell string, local
+  or remote: a wrapper that runs `ssh host "psql -v rows='$rows' ..."` runs a slug such as `x'; touch f; echo '` on the database host.
+  Pass every value as its own argument, and when the words go through ssh (which joins them with spaces and hands the result to the
+  remote shell) quote each one with `shlex.quote`; or base64-encode the value on this side and decode it in a fixed script on the far
+  side. A wrapper that is safe in this way:
+
+  ```python
+  #!/usr/bin/env python3
+  import json, shlex, subprocess, sys
+  req = json.load(sys.stdin)
+  words = ["psql", "-X", "-q", "-A", "-t", "-F", "\t", "-d", "gbrain", "-v", "ON_ERROR_STOP=1"]
+  for name, value in req["variables"].items():
+      words += ["-v", f"{name}={value}"]
+  remote = " ".join(shlex.quote(w) for w in words)      # every word quoted for the remote shell
+  r = subprocess.run(["ssh", "-o", "BatchMode=yes", "dbhost", remote], input=req["sql"].encode())
+  sys.exit(r.returncode)
+  ```
+
+- **The setting** is a JSON list of strings, or one plain string split like a shell would; `~` in the first word is expanded and no
+  shell is involved. These values mean unset, and the lookup is the default one: `null`, `false`, an empty list, an empty string and
+  a whitespace-only string. Any other value that is not a command (`0`, `{}`, a list with a non-string, a list whose first word is
+  blank, an unterminated quote) is set but unusable: nothing is looked up, no local database is read, every call goes on, and one
+  note on stderr says the setting is not a command.
+- **Time**: the command gets what is left of `GBRAIN_REDIRECT_BUDGET` (2 s). It runs in its own process group; at the deadline, when it
+  prints too much, or when the hook's own timer ends the hook, the hook kills that process group. A process that left the group (its
+  own session) survives, and a command that exits by itself is not followed up: what it leaves running in the background is its own
+  business. The default 2 s is tight for an `ssh` that opens a new connection each time; use a persistent connection (`ControlMaster`
+  and `ControlPersist` in your ssh config) or raise `GBRAIN_REDIRECT_BUDGET`. A lookup that runs over the budget lets the call through.
+- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, prints more than 1 MB, prints a row of fewer than
+  three columns, or prints rows that are not followed by this run's end line as the last line, tells the guard nothing, and every call
+  goes on, with one short note on stderr that names the reason (never the command's output, a slug or a variable). One short row
+  makes the whole answer unusable on purpose: skipping it would leave its slug as not-there, and the new-page check would then refuse a
+  page that exists. The end line is what separates "the page does not exist" from "the command did not run the script" (an exit 0 with no
+  output): a page counts as new, and the new-page check refuses it, only when the end line shows the query ran to its end and found no row.
+- **Where to set it**: only in the user-level settings (Claude Code's user `settings.json` `env` block) or the XDG config file
+  (`plugin.json`). A repository's `.claude/settings.json` `env` block can set `STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND` as well, and the
+  command is run as you, so do not accept it from a project.
 
 An unset or empty setting keeps the lookup above exactly as it was.
