@@ -31,6 +31,11 @@ remove_tag, put_raw_data, takes_*), `from` (add_link, remove_link: the edge rend
 slug the portal script computes is not looked up. Reads (get_page, search, ...) are never touched. Not covered: capture (it names no
 page), delete_page, restore_page, revert_version.
 
+A row of the lookup is one line of four tab-separated columns (slug, type, redirect_to, banner). The script replaces a newline, a tab
+and a carriage return in every one of them by a space, so a value a page holds cannot end its row or start another; the hook also
+splits the output only at line ends (\\n or \\r\\n, never at the other separators Python's splitlines knows) and takes a row that does
+not have exactly four columns as a broken answer, never as a page that is not there.
+
 Lookup: one read-only query on the local gbrain Postgres database (`psql -d gbrain`, ~50 ms; PSQL_BIN and GBRAIN_DB override), else
 the gbrain CLI (`gbrain call get_page`, ~0.7 s a slug; GBRAIN_BIN overrides). The whole lookup is capped at ~2 s. Fail open: no
 psql and no gbrain CLI, no stackshot checkout, a lookup error, a timeout: the call goes on. A page counts as new only when the
@@ -68,9 +73,9 @@ the gbrain CLI is ever consulted; when it is unset the lookup is the one above, 
   * Set the command only in the user-level settings or the XDG config file: a repository's .claude/settings.json `env` block can
     set STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND too, and the command is run as the user.
   * Fail open: a command that is missing or not executable, exits nonzero, runs out of time, raises, prints more than 1 MB, prints
-    a row of fewer than three columns, or prints rows that are not followed by this run's end line (as the last line) tells the hook
-    nothing about the slugs, so every call goes on, with one short stderr note naming the reason (never the command's output, a
-    slug or a variable). An exit 0 with no output is not "no such page" but "the command did not run the script": only the end line
+    a row that does not have exactly four columns, or prints rows that are not followed by this run's end line (as the last line)
+    tells the hook nothing about the slugs, so every call goes on, with one short stderr note naming the reason (never the command's
+    output, a slug or a variable). An exit 0 with no output is not "no such page" but "the command did not run the script": only the end line
     proves the query ran, and a page counts as new (which the third check refuses) only when the query ran and found no row.
 
 Settings (plugin.json key or STACKSHOT_PLUGIN_<NAME>; see the README):
@@ -222,13 +227,21 @@ def merge(old, new):
             "redirect_to": old["redirect_to"] or new["redirect_to"], "banner": old["banner"] or new["banner"]}
 
 
+def _flat(expr):
+    """The SQL of one output column with a newline, a tab and a carriage return in it replaced by a space: the rows are lines of
+    tab-separated columns, so a value that held one could end its row or start another (a stub then reads as a short row, or a page
+    that is not there as one that is)."""
+    return "translate(%s, E'\\n\\t\\r', '   ')" % expr
+
+
 def lookup_sql(sentinel=None):
     """The one read-only lookup, as a psql script that reads the variables `rows` and `banner`. With a `sentinel` it ends with a
     select of that line, so a caller that did not run the script itself can tell whether it ran to the end."""
     sql = ("\\set ON_ERROR_STOP on\n"
            "begin transaction read only;\n"
-           "select p.slug, p.type, coalesce(p.frontmatter->>'redirect_to',''), "
-           "replace(replace(coalesce(substring(p.compiled_truth from :'banner'),''), E'\\t', ' '), E'\\r', ' ') from pages p "
+           "select %s, %s, %s, %s from pages p " % (
+               _flat("p.slug"), _flat("p.type::text"), _flat("coalesce(p.frontmatter->>'redirect_to','')"),
+               _flat("coalesce(substring(p.compiled_truth from :'banner'),'')")) +
            "join jsonb_to_recordset(:'rows'::jsonb) as w(slug text, src text) "
            "on p.slug = w.slug and (w.src is null or p.source_id = w.src) "
            "where p.deleted_at is null;\n"
@@ -241,17 +254,24 @@ def lookup_rows(pairs):
     return json.dumps([{"slug": s, "src": src} for s, src, *_ in pairs])
 
 
+def split_lines(text):
+    """The lines of the lookup's output: split at \\n or \\r\\n only. str.splitlines also splits at a form feed, a vertical tab, the
+    information separators, NEL and U+2028/2029, which a page's text may hold and the database prints as they are."""
+    return re.split(r"\r?\n", text)
+
+
 def parse_rows(pairs, lines):
-    """{slug: {exists, type, redirect_to, banner}} from the tab-separated lines the lookup printed, a slug without a row with
-    exists False. A line of fewer than three columns is skipped."""
+    """{slug: {exists, type, redirect_to, banner}} from the four-column, tab-separated lines the lookup printed, a slug without a
+    row with exists False. None when a line does not have exactly four columns: a row that was cut or run together is a broken
+    answer, never a page that is not there (skipping it would let a stub pass as an ordinary page, or refuse a page that exists)."""
     found = {s: dict(NOT_THERE) for s, *_ in pairs}
     seen = {}
     for line in lines:
         cols = line.split("\t")
-        if len(cols) < 3:
-            continue
+        if len(cols) != 4:
+            return None
         seen[cols[0]] = merge(seen.get(cols[0]), {"exists": True, "type": cols[1].strip(), "redirect_to": cols[2].strip(),
-                                                  "banner": cols[3].strip() if len(cols) > 3 else ""})
+                                                  "banner": cols[3].strip()})
     found.update(seen)
     return found
 
@@ -272,7 +292,22 @@ def lookup_psql(pairs, deadline, banner):
         _config.note("gbrain-redirect-guard", f"psql exited {r.returncode}, so the gbrain CLI is tried instead; if the setting "
                      "gbrain_moved_banner is a pattern Postgres rejects, fix it (Python and Postgres read the same pattern)")
         return None
-    return parse_rows(pairs, r.stdout.splitlines())
+    found = parse_rows(pairs, [ln for ln in split_lines(r.stdout) if ln])
+    if found is None:
+        _config.note("gbrain-redirect-guard", "psql printed a row that does not have four columns, so the gbrain CLI is tried instead")
+    return found
+
+
+def is_number(raw):
+    """True for the text of a JSON number ("0", "12", "-1", "2.5"): the environment hands a number over as text, and a bare number is
+    no command (a file's 0 is already one that is not a string)."""
+    if not isinstance(raw, str):
+        return False
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return False
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def lookup_command_argv():
@@ -291,7 +326,7 @@ def lookup_command_argv():
             pass
     elif isinstance(raw, list) and all(isinstance(x, str) for x in raw):
         argv = list(raw)
-    if not argv or not argv[0].strip():
+    if not argv or not argv[0].strip() or is_number(raw):
         _config.note("gbrain-redirect-guard", "the setting gbrain_lookup_command is not a command (a JSON list of strings, or one "
                      "string); nothing is looked up and every call goes on")
         return []
@@ -402,7 +437,8 @@ def lookup_command(pairs, deadline, banner, argv):
         if proc is not None:
             _end_group(proc)
     if status == "timeout":
-        _cmd_note("ran out of time (GBRAIN_REDIRECT_BUDGET); use a persistent ssh connection or raise it")
+        _cmd_note("ran out of time (the budget is GBRAIN_REDIRECT_BUDGET); make it faster, for example by reusing a connection it "
+                  "opens, or raise the budget")
         return {}
     if status == "toolong":
         _cmd_note(f"printed more than {MAX_OUTPUT} bytes")
@@ -410,17 +446,18 @@ def lookup_command(pairs, deadline, banner, argv):
     if proc.returncode != 0:
         _cmd_note(f"exited with status {proc.returncode}")
         return {}
-    lines = [ln for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+    lines = [ln for ln in split_lines(raw.decode("utf-8", errors="replace")) if ln.strip()]
     if not lines or lines[-1] != sentinel:
         _cmd_note("printed no end line for this run (it did not run the script, or its output was cut)")
         return {}
     rows = lines[:-1]
-    # One short row makes the whole answer unusable, on purpose: skipping it would leave its slug as not-there, and the new-page
-    # check would then refuse a page that exists.
-    if any(len(ln.split("\t")) < 3 for ln in rows):
-        _cmd_note("printed a row with fewer than three columns")
+    # One broken row makes the whole answer unusable, on purpose: skipping it would leave its slug as not-there, and a stub would
+    # pass as an ordinary page, or the new-page check would refuse a page that exists.
+    found = parse_rows(pairs, rows)
+    if found is None:
+        _cmd_note("printed a row that does not have four columns")
         return {}
-    return parse_rows(pairs, rows)
+    return found
 
 
 def lookup_cli(pairs, deadline, banner_re):

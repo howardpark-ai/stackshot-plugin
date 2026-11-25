@@ -128,11 +128,11 @@ The contract:
   own session) survives, and a command that exits by itself is not followed up: what it leaves running in the background is its own
   business. The default 2 s is tight for an `ssh` that opens a new connection each time; use a persistent connection (`ControlMaster`
   and `ControlPersist` in your ssh config) or raise `GBRAIN_REDIRECT_BUDGET`. A lookup that runs over the budget lets the call through.
-- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, prints more than 1 MB, prints a row of fewer than
-  three columns, or prints rows that are not followed by this run's end line as the last line, tells the guard nothing, and every call
-  goes on, with one short note on stderr that names the reason (never the command's output, a slug or a variable). One short row
-  makes the whole answer unusable on purpose: skipping it would leave its slug as not-there, and the new-page check would then refuse a
-  page that exists. The end line is what separates "the page does not exist" from "the command did not run the script" (an exit 0 with no
+- **Fail open**: a command that is missing, not executable, exits nonzero, is too slow, prints more than 1 MB, prints a row that does
+  not have exactly four columns, or prints rows that are not followed by this run's end line as the last line, tells the guard nothing,
+  and every call goes on, with one short note on stderr that names the reason (never the command's output, a slug or a variable). One
+  broken row makes the whole answer unusable on purpose: skipping it would leave its slug as not-there, and the new-page check would
+  then refuse a page that exists. The end line is what separates "the page does not exist" from "the command did not run the script" (an exit 0 with no
   output): a page counts as new, and the new-page check refuses it, only when the end line shows the query ran to its end and found no row.
 - **Where to set it**: only in the user-level settings (Claude Code's user `settings.json` `env` block) or the XDG config file
   (`plugin.json`). A repository's `.claude/settings.json` `env` block can set `STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND` as well, and the
