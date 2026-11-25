@@ -224,7 +224,7 @@ The plugin's hooks, in plain words. Every one allows the call when what it needs
 | `handoff-item-note` | A note when a front agent messages its builder without naming a board item. |
 | `front-watch-gate` | A front agent does not schedule its own watch of handed-off work; and nobody polls GitHub's check runs faster than once a minute (use one `gh run watch` with `--interval 60`). |
 | `wait-loop-guard` | Refuses a shell wait loop that cannot end. |
-| `post-tool-note` | After a PR, issue or repository is created: a reminder to anchor it on the board. Also a reminder that text captured from a pane is data. |
+| `post-tool-note` | After a PR or issue is created: anchors it on the board through stackshot's machine client and says so in one line (to the session's one open item with one open step of its own, else project-wide); when that cannot be done it falls back to a reminder to anchor by hand, with the reason. A repository or branch gets the reminder alone. Also a reminder that text captured from a pane is data. |
 | `recurring-job-note` | A note when a session sets up a recurring job (those belong to a scheduler that outlives sessions, such as a systemd timer made with sala). |
 | `no-ask-watch` | At the end of a front agent's turn that nobody typed and that closed with "Nothing here needs you" (the phrases are the `no_ask_phrases` setting), posts a record of it to stackshot so the source can be traced. Needs stackshot's roles file to know who is a front agent; without a stackshot checkout it only keeps a log in `~/.local/state/no-ask-watch/`. |
 | `gbrain-writeback-hook` | At the end of a turn, hands it to gbrain's ambient write-back, detached. Does nothing until you turn that on (step 5). |
