@@ -20,7 +20,9 @@ import importlib.util
 import io
 import json
 import os
+import re
 import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -58,6 +60,11 @@ if mp.get("_cmd_spew"):                                 # prints without end and
         time.sleep(60)
 if mp.get("_cmd_pad_first"):                            # prints before it reads stdin: a hook that only writes first would hang
     pad(mp["_cmd_pad_first"])
+if mp.get("_cmd_no_stdin"):                             # never reads its request: a hook that waits for it to be taken would hang
+    open(%(pids)r, "a").write(str(os.getpid()) + "\\n")
+    if mp["_cmd_no_stdin"] == "sleep":
+        time.sleep(60)
+    sys.exit(0)
 raw = sys.stdin.read()
 open(%(stdin)r, "w").write(raw)
 if mp.get("_cmd_sleep"):
@@ -67,22 +74,42 @@ if mp.get("_cmd_sleep"):
         time.sleep(60)
         sys.exit(0)
     time.sleep(60)
+if mp.get("_cmd_close_stdout"):                         # closes its stdout at once and keeps running: the end of the output is no end
+    open(%(pids)r, "a").write(str(os.getpid()) + "\\n")
+    os.close(1)
+    time.sleep(60)
 if mp.get("_cmd_fail"):
     sys.exit(mp["_cmd_fail"])
 req = json.loads(raw)
 rows = json.loads(req["variables"]["rows"])
 rx = re.compile(req["variables"]["banner"])
 mode = mp.get("_cmd_end", "ok")
-for w in rows:
+end = re.search(r"select '(lookup-complete-[0-9a-f]+)';", req["sql"])
+
+
+def row_of(w):                                          # the row of a page that is there, as the script would print it (None: no page)
     p = mp.get(w["slug"])
     if not isinstance(p, dict):
-        continue
+        return None
     m = rx.search(p.get("body", ""))
+    return "\\t".join([w["slug"], p.get("type", "note"), p.get("redirect_to", ""), m.group(1) if m else ""])
+
+
+if mp.get("_cmd_total"):                                # an answer of exactly this many bytes: the real rows, one pad row, the end line
+    real = "".join(row_of(w) + "\\n" for w in rows if row_of(w) is not None)
+    head = "pad\\tnote\\t\\t"
+    fill = mp["_cmd_total"] - len(real) - len(end.group(1)) - 1 - len(head) - 1
+    sys.stdout.write(real + head + "z" * fill + "\\n" + end.group(1) + "\\n")
+    sys.stdout.flush()
+    sys.exit(0)
+for w in rows:
+    line = row_of(w)
+    if line is None:
+        continue
     if mode == "short-rows":                            # the page is there, its row has two columns
         print(w["slug"] + "\\tnote")
     else:
-        print("\\t".join([w["slug"], p.get("type", "note"), p.get("redirect_to", ""), m.group(1) if m else ""]))
-end = re.search(r"select '(lookup-complete-[0-9a-f]+)';", req["sql"])
+        print(line)
 if mode in ("ok", "short-rows"):
     print(end.group(1))
 elif mode == "canned":                                  # the end line of some other run
@@ -442,7 +469,7 @@ class CommandLookup(unittest.TestCase):
             put = {"slug": NEW, "content": "x"}
             e.with_pages(**{NEW: G.page(), "_cmd_end": "short-rows"})            # the page exists; its row has two columns
             self.assertEqual(self.verdict(e, "put_page", put)[0], "allow", "a page that exists was refused on a short row")
-            self.assertIn("fewer than three columns", e.last_err)
+            self.assertIn("does not have four columns", e.last_err)
             e.with_pages(**{NEW: G.page()})                                      # the same page, a full row
             self.assertEqual(self.verdict(e, "put_page", put)[0], "allow")
             e.with_pages()                                                       # a page that is not there: the check is armed
@@ -459,9 +486,10 @@ class CommandLookup(unittest.TestCase):
                      ("rows without the end line", {"_cmd_end": "garbage"}, "printed no end line", None),
                      ("the end line of another run", {"_cmd_end": "canned"}, "printed no end line", None),
                      ("a line after the end line", {"_cmd_end": "text-after"}, "printed no end line", None),
-                     ("a short row", {"_cmd_end": "short-row"}, "fewer than three columns", None),
+                     ("a short row", {"_cmd_end": "short-row"}, "does not have four columns", None),
                      ("too much output", {"_cmd_pad_first": CAP + 250_000}, f"printed more than {CAP} bytes", None),
-                     ("too slow", {"_cmd_sleep": True}, "ran out of time", budget)]
+                     ("too slow", {"_cmd_sleep": True}, "ran out of time", budget),
+                     ("stdout closed, still running", {"_cmd_close_stdout": True}, "ran out of time", budget)]
             try:
                 for what, extra, phrase, env in cases:
                     e.with_pages(**extra)
@@ -485,11 +513,158 @@ class CommandLookup(unittest.TestCase):
                 self.assert_one_note(e, "the setting gbrain_lookup_command is not a command", repr(value))
                 self.assertFalse(e.local_lookup_ran(), repr(value))
             os.remove(os.path.join(home, ".config", "stackshot", "plugin.json"))
-            for text in ("'unterminated", '""', "[1]", "{}"):                              # the environment's values
+            for text in ("'unterminated", '""', "[1]", "{}", "0", "12", "-1", "2.5"):    # the environment's values (a number is text there)
                 e.env["STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND"] = text
                 self.assertEqual(e.run(G.GB + "add_tag", {"slug": G.STUB, "tag": "x"}), "", text)
                 self.assert_one_note(e, "the setting gbrain_lookup_command is not a command", text)
                 self.assertFalse(e.local_lookup_ran(), text)
+
+    def test_stdout_is_read_up_to_the_cap_exactly(self):
+        """The cap is 1048576 bytes of everything the command prints, the end line included: that many is an answer, one more is not."""
+        self.assertEqual(CAP, 1048576)
+        with temp_home() as home:
+            e = CmdEnv(home)
+            try:
+                e.with_pages(_cmd_total=CAP)
+                self.assertEqual(self.verdict(e, "add_tag", {"slug": G.STUB, "tag": "x"})[0], "deny", "an answer of exactly the cap")
+                self.assertEqual(e.last_err, "")
+                e.with_pages(_cmd_total=CAP + 1)
+                self.assertEqual(self.verdict(e, "add_tag", {"slug": G.STUB, "tag": "x"})[0], "allow", "one byte over the cap")
+                self.assert_one_note(e, f"printed more than {CAP} bytes", "one byte over the cap")
+                e.with_pages(_cmd_total=CAP - 1)
+                self.assertEqual(self.verdict(e, "add_tag", {"slug": G.STUB, "tag": "x"})[0], "deny", "one byte under the cap")
+            finally:
+                self.end_leftovers(e, home)
+
+    def test_a_command_that_closes_its_stdout_and_keeps_running_hits_the_deadline_and_is_ended(self):
+        """The end of the output is not the end of the command: the hook waits for its exit only until its own deadline, ends the
+        command's group then, and does not wait for the hook's timer (budget + 1 s) to do it."""
+        with temp_home() as home:
+            e = CmdEnv(home)
+            e.with_pages(_cmd_close_stdout=True)
+            env = dict(e.env, GBRAIN_REDIRECT_BUDGET="1")
+            try:
+                t = time.time()
+                self.assertEqual(e.run(G.GB + "add_tag", {"slug": G.STUB, "tag": "x"}, env=env), "")
+                self.assertLess(time.time() - t, 1.7, "the command's own deadline ended it, not the hook's timer at budget + 1 s")
+                self.assert_one_note(e, "ran out of time", "stdout closed, command still running")
+                pids = self.pids_of(e)
+                self.assertEqual(len(pids), 1)
+                time.sleep(0.3)
+                self.assertEqual([p for p in pids if self.alive(p)], [], "the command outlived the hook")
+            finally:
+                self.end_leftovers(e, home)
+
+    def test_a_command_that_never_reads_its_stdin_does_not_hold_the_hook(self):
+        """The hook's ends of the two pipes are not blocking: a request bigger than a pipe holds (280 KB here), sent to a command that
+        reads none of it, would block a plain write until the hook's timer; here the deadline of the lookup ends it."""
+        pages = {"pages": [{"slug": "projects/slug-%05d" % i, "content": "x"} for i in range(6000)]}
+        with temp_home() as home:
+            e = CmdEnv(home)
+            env = dict(e.env, GBRAIN_REDIRECT_BUDGET="1")
+            try:
+                e.with_pages(_cmd_no_stdin="sleep")                                    # alive, not reading: the write would block
+                t = time.time()
+                self.assertEqual(e.run(G.GB + "put_pages", pages, env=env), "")
+                self.assertLess(time.time() - t, 1.7, "the lookup's own deadline ended it, not the hook's timer at budget + 1 s")
+                self.assert_one_note(e, "ran out of time", "a command that does not read its stdin")
+                pids = self.pids_of(e)
+                self.assertEqual(len(pids), 1)
+                time.sleep(0.3)
+                self.assertEqual([p for p in pids if self.alive(p)], [], "the command outlived the hook")
+                e.with_pages(_cmd_no_stdin="exit")                                     # gone at once: the write meets a closed pipe
+                t = time.time()
+                self.assertEqual(e.run(G.GB + "put_pages", pages, env=env), "")
+                self.assertLess(time.time() - t, 1.7)
+                self.assert_one_note(e, "printed no end line", "a command that exits without reading its stdin")
+            finally:
+                self.end_leftovers(e, home)
+
+    def test_the_pipes_are_not_blocking_while_the_hook_talks_to_the_command(self):
+        """What the test above relies on, said directly: _talk makes both of its pipe ends non-blocking."""
+        with temp_home() as home:
+            e = CmdEnv(home)
+            e.with_pages(_cmd_no_stdin="sleep")
+            seen = {}
+            try:
+                with guard_module(home) as mod, alarm(6):
+                    proc = subprocess.Popen([e.cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                            cwd=home, start_new_session=True, bufsize=0)
+                    seen["before"] = (os.get_blocking(proc.stdin.fileno()), os.get_blocking(proc.stdout.fileno()))
+                    try:
+                        status, raw = mod._talk(proc, b"x" * 300_000, time.time() + 0.5)         # more than a pipe holds, never read
+                        seen["after"] = (os.get_blocking(proc.stdin.fileno()), os.get_blocking(proc.stdout.fileno()))
+                    finally:
+                        mod._end_group(proc)
+                self.assertEqual((status, raw), ("timeout", None))
+                self.assertEqual(seen["before"], (True, True), "a pipe starts blocking")
+                self.assertEqual(seen["after"], (False, False), "neither end is blocking while the hook talks")
+            finally:
+                self.end_leftovers(e, home)
+
+    def test_a_row_cut_or_run_together_by_a_value_is_a_broken_answer_never_a_page_that_is_not_there(self):
+        """A value of a column that holds a newline, a tab or a carriage return (the script replaces them, but the answer is also
+        checked here, in case a command or a database prints them as they are). Every one of these leaves the call going on with
+        one short note, and none turns the stub into an ordinary page without a word."""
+        crafted = [("a newline in redirect_to", {"redirect_to": "notes/a\nb"}),
+                   ("a newline at the end of redirect_to", {"redirect_to": "notes/a\n"}),
+                   ("a tab in redirect_to", {"redirect_to": "notes/a\tb"}),
+                   ("a CRLF in redirect_to", {"redirect_to": "notes/a\r\nb"}),
+                   ("a newline in type", {"type": "redirect\nnote"}),
+                   ("a tab in type", {"type": "red\tirect"}),
+                   ("a CRLF in type", {"type": "note\r\nredirect"}),
+                   ("a value that starts a second row", {"redirect_to": "x\nnotes/forged\tnote\t"})]
+        with temp_home() as home:
+            e = CmdEnv(home)
+            e.setting(**NEW_SETTINGS)
+            for what, extra in crafted:
+                e.with_pages(**{"notes/crafted": G.page(**{"type": "redirect", **extra})})
+                d, _why = self.verdict(e, "add_tag", {"slug": "notes/crafted", "tag": "x"})
+                self.assertEqual(d, "allow", what)
+                self.assert_one_note(e, "does not have four columns", what)
+                self.assertFalse(e.local_lookup_ran(), what)
+
+    def test_the_other_line_separators_of_python_do_not_split_a_row(self):
+        """str.splitlines also splits at a vertical tab, a form feed, the information separators, NEL and U+2028/2029. A row is cut
+        at a newline only, so a stub whose redirect_to holds one of them is still one row and is refused, naming all of it."""
+        seps = "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+        with temp_home() as home:
+            e = CmdEnv(home)
+            e.setting(**NEW_SETTINGS)
+            for sep in seps:
+                target = "notes/a" + sep + "b"
+                e.with_pages(**{"notes/crafted": G.page(type="redirect", redirect_to=target)})
+                d, why = self.verdict(e, "add_tag", {"slug": "notes/crafted", "tag": "x"})
+                self.assertEqual((d, e.last_err), ("deny", ""), repr(sep))
+                self.assertTrue(why.startswith(f"notes/crafted is a redirect to {target}: write to"), repr(sep))
+                e.with_pages(**{NEW: G.page(redirect_to=target)})                        # an existing page of the other brain's kind
+                self.assertEqual(self.verdict(e, "put_page", {"slug": NEW, "content": "x"})[0], "allow", repr(sep))
+                self.assertEqual(e.last_err, "", repr(sep))
+            with guard_module(home) as mod:                                            # a newline or a CRLF ends a line, a lone CR does not
+                self.assertEqual(mod.split_lines("a\r\nb\nc\rd\x0be"), ["a", "b", "c\rd\x0be"])
+
+    def test_a_number_in_the_environment_is_not_a_command_it_is_not_looked_for(self):
+        with temp_home() as home:
+            e = CmdEnv(home, command=None)
+            for text in ("0", "7", "-3", "1.5", "1e3"):
+                e.env["STACKSHOT_PLUGIN_GBRAIN_LOOKUP_COMMAND"] = text
+                self.assertEqual(e.run(G.GB + "add_tag", {"slug": G.STUB, "tag": "x"}), "", text)
+                self.assert_one_note(e, "the setting gbrain_lookup_command is not a command", text)
+                self.assertNotIn("was not found", e.last_err, text)
+                self.assertFalse(e.local_lookup_ran(), text)
+
+    def test_the_time_note_is_right_for_any_command(self):
+        """The note of a slow command names the budget and does not say the command is an ssh."""
+        with temp_home() as home:
+            e = CmdEnv(home)
+            e.with_pages(_cmd_sleep=True)
+            try:
+                self.assertEqual(e.run(G.GB + "add_tag", {"slug": G.STUB, "tag": "x"}, env=dict(e.env, GBRAIN_REDIRECT_BUDGET="0.5")), "")
+                self.assert_one_note(e, "ran out of time", "a slow command")
+                self.assertIn("GBRAIN_REDIRECT_BUDGET", e.last_err)
+                self.assertNotIn("ssh", e.last_err.lower())
+            finally:
+                self.end_leftovers(e, home)
 
     def assert_one_note(self, e, phrase, what):
         lines = e.last_err.splitlines()
@@ -545,6 +720,95 @@ class CommandLookup(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
+
+
+class RowShape(unittest.TestCase):
+    """What a value a page holds cannot do to the rows of the lookup. The script flattens a newline, a tab and a carriage return in
+    every column it prints; the parser takes a row that does not have four columns as a broken answer. The suite has no database, so
+    the script is checked as text (and its replacement set applied to a crafted value by the same rule), and the parser against the
+    stand-ins, which print what they are given as it is."""
+
+    COLUMNS = ("p.slug", "p.type::text", "coalesce(p.frontmatter->>'redirect_to','')", "coalesce(substring(p.compiled_truth from :'banner'),'')")
+
+    @staticmethod
+    def module(home):
+        return guard_module(home)
+
+    def test_the_script_flattens_every_column_it_prints(self):
+        with temp_home() as home, self.module(home) as mod:
+            for sql in (mod.lookup_sql(), mod.lookup_sql("lookup-complete-ab")):
+                select = sql[sql.index("select "):sql.index(" from pages p")]
+                for col in self.COLUMNS:
+                    self.assertIn("translate(%s, E'\\n\\t\\r', '   ')" % col, select, col)
+                self.assertEqual(select.count("translate("), 4, "a column is printed as it is")
+                self.assertNotIn("replace(", select)
+
+    def test_the_replacement_of_the_script_leaves_a_crafted_value_one_row(self):
+        """Apply the script's own replacement set (read from its text) to a value shaped like a second row of an existing page, and
+        give that to the hook as the row: the page that is not there stays not there, and the check of new pages still refuses it."""
+        with temp_home() as home:
+            with self.module(home) as mod:
+                sets = set(re.findall(r"E'((?:\\[ntr])+)', '( +)'\)", mod.lookup_sql()))
+            self.assertEqual(len(sets), 1, "the four columns use one replacement")
+            (chars, repl), = sets
+            esc = {"n": "\n", "t": "\t", "r": "\r"}
+            from_chars = [esc[c] for c in chars.replace("\\", "")]
+            self.assertEqual((sorted(from_chars), len(repl)), (sorted(["\n", "\r", "\t"]), 3))
+
+            def flat(value):                                                        # postgres translate(): character i -> character i
+                return value.translate({ord(f): repl[i] for i, f in enumerate(from_chars)})
+            self.assertEqual(flat("a\nb\tc\rd"), "a b c d")
+            crafted = "x\ty\n" + NEW + "\tnote\t"
+            raw_rows = ("notes/crafted\tredirect\t" + crafted + "\t").split("\n")
+            self.assertEqual([len(r.split("\t")) for r in raw_rows], [4, 4], "the shape this value takes if nothing flattens it")
+            e = CmdEnv(home)
+            e.setting(**NEW_SETTINGS)
+            e.with_pages(**{"notes/crafted": G.page(type="redirect", redirect_to=flat(crafted))})
+            out = e.run(G.GB + "add_tag", {"slug": "notes/crafted", "tag": "x"})
+            self.assertEqual(decision(out), "deny")
+            self.assertIn("notes/crafted is a redirect to x y " + NEW + " note", reason(out))
+            out = e.run(G.GB + "put_page", {"slug": NEW, "content": "x"})
+            self.assertEqual(decision(out), "deny", "the page the value named does not exist, and the check says so")
+            self.assertIn(f"{NEW} is a new page of the other brain", reason(out))
+
+
+class PsqlRows(unittest.TestCase):
+    """The same rows on the local path (psql, then the gbrain CLI). The stand-in psql prints a value as it is, which is what a
+    database does without the script's replacement; a row it cuts or runs together makes psql's answer unusable, and the CLI is asked."""
+
+    def run_case(self, e, tool, inp, **kw):
+        out = e.run(G.GB + tool, inp, **kw)
+        return decision(out), reason(out)
+
+    def test_a_row_cut_by_a_value_is_not_trusted_and_the_cli_decides(self):
+        with temp_home() as home:
+            e = G.Env(home)
+            for what, value in (("a newline", "notes/a\nb"), ("a tab", "notes/a\tb"), ("a CR", "notes/a\rb"), ("a CRLF", "notes/a\r\nb")):
+                e.set_pages(dict(e.default_pages(), **{"notes/crafted": G.page(type="redirect", redirect_to=value)}))
+                d, why = self.run_case(e, "add_tag", {"slug": "notes/crafted", "tag": "x"})
+                self.assertEqual(d, "deny", what)
+                self.assertIn("notes/crafted is a redirect to notes/a", why, what)
+                lines = e.last_err.splitlines()
+                self.assertEqual(len(lines), 1, what)
+                self.assertIn("psql printed a row that does not have four columns, so the gbrain CLI is tried instead", lines[0], what)
+            e.set_pages(dict(e.default_pages(), **{"notes/crafted": G.page(type="red\tirect")}))      # a cut type: the CLI reads it as it is
+            self.assertEqual(self.run_case(e, "add_tag", {"slug": "notes/crafted", "tag": "x"})[0], "allow")
+            self.assertIn("does not have four columns", e.last_err)
+
+    def test_a_cut_row_never_makes_an_existing_page_look_new(self):
+        """The row of a page that exists is cut by its value: skipped, it would leave the page as not-there, and the third check would
+        refuse a write to a page that is there. With the CLI absent as well nothing is known, and the call goes on."""
+        with temp_home() as home:
+            e = G.Env(home)
+            e.setting(**G.NEW_SETTINGS)
+            e.set_pages(dict(e.default_pages(), **{G.NEW: G.page(redirect_to="a\nb")}))
+            put = {"slug": G.NEW, "content": "x"}
+            self.assertEqual(self.run_case(e, "put_page", put)[0], "allow", "the CLI found the page")
+            env = dict(e.env, GBRAIN_BIN=os.path.join(home, "no-such-gbrain"))
+            self.assertEqual(self.run_case(e, "put_page", put, env=env)[0], "allow", "nothing known: the call goes on")
+            self.assertIn("does not have four columns", e.last_err)
+            e.set_pages(e.default_pages())                                             # a page that is not there: the check is armed
+            self.assertEqual(self.run_case(e, "put_page", put)[0], "deny")
 
 
 class Unset(unittest.TestCase):
