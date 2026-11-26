@@ -54,7 +54,7 @@ memory and gbrain's own steps cover them), anchor-hub, other client machines, th
 | Plugin repository | `https://github.com/howardpark-ai/stackshot-plugin` (public; MIT; clones and installs over https with no credentials) |
 | Install | `claude plugin marketplace add howardpark-ai/stackshot-plugin`, then `claude plugin install stackshot@stackshot-plugin` (scope `user`); inside a session `/plugin marketplace add ...` and `/plugin install ...` |
 | Update | `claude plugin marketplace update stackshot-plugin`, then `claude plugin update --scope user stackshot@stackshot-plugin`; a new session or `/reload-plugins` loads it |
-| Contents | the hooks of `hooks/hooks.json` (the person's guide, section 4, lists them), the `spawn` skill, agents `executor`, `deep-engineer`, `sweeper` |
+| Contents | the hooks of `hooks/hooks.json` (the person's guide, section 4, lists them), the `spawn` skill, agents `executor`, `deep-engineer`, `sweeper` (they start without CLAUDE.md files, the user's rulebook included, and without `Skill` and some other tools; MCP tools stay: [the helper agents](hooks.md#the-helper-agents)) |
 | Needs | `python3` 3.12+ (the board guide's requirement) and `bash` on `PATH`; standard library only |
 | Plugin settings | env `STACKSHOT_PLUGIN_<NAME>`, else key in `${XDG_CONFIG_HOME:-~/.config}/stackshot/plugin.json`, else default. Claude Code passes the `env` block of `settings.json` to hooks |
 | Hook logs | `${XDG_STATE_HOME:-~/.local/state}/build-stops/firings.jsonl`, `.../front-watch-gate/firings.jsonl`, `.../no-ask-watch/firings.jsonl` (plus its `pending.jsonl` and `state.json`; `python3 hooks/no-ask-watch.py --replay [file]` posts the log to stackshot again, idempotently), prompt stamps in `.../stackshot/prompts/` |

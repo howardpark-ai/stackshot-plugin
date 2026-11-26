@@ -5,8 +5,9 @@ The helper agents are called by name from briefs, rulebooks and the `subagent-mo
 plugin, and calls them by that plugin's namespace, moves over in three steps and never has a day on which a name stops working:
 
 1. **Both namespaces answer.** Install this plugin and list the old plugin's name in `agent_namespaces` next to `stackshot`. The
-   gate then treats `<old>:deep-engineer` and `stackshot:deep-engineer` the same, and the old agents keep working untouched. The
-   two sets of agent files are identical in content (the old plugin's copies are this plugin's files), so nothing changes in behavior.
+   gate then treats `<old>:deep-engineer` and `stackshot:deep-engineer` the same, and the old agents keep working untouched. When
+   the old plugin's copies are this plugin's current files, nothing changes in behavior; a copy from before version 0.1.15 still
+   loads the CLAUDE.md files and every tool, unlike [the helper agents](hooks.md#the-helper-agents) here.
 2. **Calls move.** Rulebooks, briefs and skills that name `<old>:executor` are rewritten to `stackshot:executor`, one source at a
    time. A name that was missed still resolves, through step 1.
 3. **The old agents go.** When a search of the rulebooks and briefs finds no `<old>:` agent name, the old plugin drops its three agent

@@ -231,7 +231,7 @@ The plugin's hooks, in plain words. Every one allows the call when what it needs
 | `gbrain-redirect-guard` | Refuses a gbrain write aimed at a redirect stub left by a page rename, or at a page that has moved to another brain (a pointer page whose banner says so), and names the page to write to. Optionally also refuses creating a new page that belongs on the other brain (off until configured). |
 | `subagent-model-gate` | Build work goes to the `executor` agent (a Sonnet-class model); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. A `fable` model override passes only for design and analysis, on `general-purpose` or `claude` with a `Design:` line. |
 | `spawn` skill | Starts a named tmux + Claude Code session through `sala spawn`. Says so and stops when sala is missing. |
-| agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gate and the briefs refer to. |
+| agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gate and the briefs refer to. They start without CLAUDE.md files, so your rulebook does not reach them that way, and without some tools, skills among them ([the helper agents](hooks.md#the-helper-agents)). |
 
 Some of these only matter once you have front and builder sessions (`build-stops`, `handoff-item-note`, `front-watch-gate`'s first rule); they stay silent until stackshot's roles file lists such sessions.
 
