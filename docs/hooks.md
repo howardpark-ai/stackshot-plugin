@@ -20,7 +20,45 @@ lookup), so they ship together and install with one command.
 | `gbrain-redirect-guard` | Refuses a gbrain write aimed at a redirect stub left by a page rename, or at a page that has moved to another brain (a pointer page whose banner says so), and names the page to write to. Optionally also refuses creating a new page that belongs on the other brain (off until configured). The lookup is a local `psql` or the gbrain CLI, or a command of your own for a brain whose database is elsewhere (`gbrain_lookup_command`). |
 | `subagent-model-gate` | Build work goes to the `executor` agent (Sonnet); `deep-engineer` (Opus) only as an escalation with an `Escalation:` line. A `fable` model override passes only for design and analysis, on `general-purpose` or `claude` with a `Design:` line. |
 | `spawn` skill | Spawns a named tmux + Claude Code session through `sala spawn`. |
-| agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gates and the briefs refer to. |
+| agents `executor`, `deep-engineer`, `sweeper` | The helper subagents the gates and the briefs refer to ([below](#the-helper-agents)). |
+
+## The helper agents
+
+All three start small: without CLAUDE.md files and without tools such a helper has no use for. Both are fields of the agent file
+that Claude Code's [subagent page](https://code.claude.com/docs/en/sub-agents) describes.
+
+**No CLAUDE.md files** (`omitClaudeMd: true`, Claude Code 2.1.271 or later; an older version ignores the field and loads them). The
+user, project and local CLAUDE.md files, and what they import, are left out of the agent's starting context. Managed policy files
+still load, and so do a subdirectory's `CLAUDE.md` and matching path-scoped rules once the agent works with files there. Each agent's
+own instructions tell it to follow a rules note given at its start; `executor` and `deep-engineer` are also told to read a
+repository's `CLAUDE.md`, `AGENTS.md` or `CONTRIBUTING` file before changing anything there.
+
+**Some tools left out** (`disallowedTools`). An agent gets the tools Claude Code gives a subagent in your session, minus these:
+
+| Left out | What the agent cannot do |
+|---|---|
+| `Skill` | Invoke skills. Its start carries no list of them either (seen on Claude Code 2.1.332; the documentation says only that the agent cannot invoke them). |
+| `Agent`, `Workflow` | Start agents of its own. |
+| `SendMessage`, `PushNotification`, `AskUserQuestion` | Send messages, notify you or ask you. It reports to the session that called it. |
+| `Artifact` | Publish artifacts. |
+| `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger` | Schedule work. |
+| `EnterPlanMode`, `ExitPlanMode`, `EnterWorktree`, `ExitWorktree` | Switch itself into plan mode or into a worktree. |
+
+- Everything else stays, among them `Read`, `Edit`, `Write`, `NotebookEdit`, `Bash`, `WebFetch`, `WebSearch`, `ToolSearch`,
+  `Monitor` and `TaskStop`, and the tools of your MCP servers and connectors.
+- Claude Code already withholds some of the names above from subagents on its own, from background ones most of all
+  ([available tools](https://code.claude.com/docs/en/sub-agents#available-tools)); for those the line changes nothing.
+
+**To give them your rules**, add a [`SubagentStart` hook](https://code.claude.com/docs/en/hooks#subagentstart) to your own settings
+that returns them as `additionalContext`, with the matcher `^stackshot:(executor|deep-engineer|sweeper)$`; the plugin ships no such
+hook. A rule that matters for one job can also go into the brief.
+
+**To change their tools**, copy the agent file into `~/.claude/agents/` (or a project's `.claude/agents/`), edit its
+`disallowedTools` or `omitClaudeMd` line, and call the copy by its own name, without the `stackshot:` prefix. Remove a name to give
+a tool back. To narrow further, add names: `mcp__<server>` leaves out one MCP server's tools and `mcp__*` leaves out all of them
+([restrict which tools a subagent can use](https://code.claude.com/docs/en/sub-agents#restrict-which-tools-a-subagent-can-use)), or
+set a `tools` allowlist. A plugin update replaces the plugin's files, and your copy does not change the `stackshot:` agent. A copy
+does not follow later plugin versions.
 
 ## How `post-tool-note` reads a command
 

@@ -19,7 +19,8 @@ You need `bash` and Python 3.12 or newer as `python3`. Check the install with `/
 - **Hooks** that make the board, sala and gbrain work together. They guard the board's repository, hand build work to builders, stop
   endless waits, check gbrain writes and stamp prompts.
 - **The `spawn` skill**, which starts a named tmux + Claude Code session through `sala spawn`.
-- **Three helper agents**: `executor`, `deep-engineer` and `sweeper`.
+- **Three helper agents**: `executor`, `deep-engineer` and `sweeper`. They start without your CLAUDE.md files and without
+  [some tools](docs/hooks.md#the-helper-agents), skills among them.
 - **Settings**, read from `STACKSHOT_PLUGIN_<NAME>` environment variables or from `~/.config/stackshot/plugin.json`, all with
   neutral defaults.
 
