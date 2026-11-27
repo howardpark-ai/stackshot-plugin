@@ -9,7 +9,7 @@ import unittest
 import _support as S
 from _support import context, decision, env_for, make_stub_stackshot, run_hook, temp_home
 
-NOTE = "Hand-off with no item: file the item first and hand it over by id, with what done means."
+NOTE = "Hand-off with no item: file the item first and hand it over by id, with the user-visible result and what done means."
 PROJECT = "prj_testproj"
 CFG = {"projects": {PROJECT: {"short": "widgets", "builder": "acme-builder"}}}
 PLAIN = "Please add retries to the uploader and make it pass the suite."

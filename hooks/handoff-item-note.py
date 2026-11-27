@@ -4,7 +4,7 @@
 Never a block, never an ask: it prints hookSpecificOutput.additionalContext (no permissionDecision, so the call goes on as it would
 have) and exits 0. The note is one line:
 
-    Hand-off with no item: file the item first and hand it over by id, with what done means.
+    Hand-off with no item: file the item first and hand it over by id, with the user-visible result and what done means.
 
 It fires when ALL of these hold, and is silent in every other case (and on any doubt):
 
@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 import _config  # noqa: E402
 
 TAG = "(handoff-item-note.py)"
-NOTE = "Hand-off with no item: file the item first and hand it over by id, with what done means. " + TAG
+NOTE = "Hand-off with no item: file the item first and hand it over by id, with the user-visible result and what done means. " + TAG
 DEFAULT_ITEM_REFS = (r"\b[a-z][\w-]*#\d+", r"/items/[\w-]*\d")
 
 STR = r"""(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)"""
