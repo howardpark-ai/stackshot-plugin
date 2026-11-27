@@ -130,6 +130,7 @@ class BuildStops(Neutral):
             back = env_for(home, BUILD_STOPS_ROLES=roles, BUILD_STOPS_NAME="acme-builder", STACKSHOT_PLUGIN_BUILD_STOPS=json.dumps(cfg))
             start = {"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup"}
             self.assertIn("acme-builder", context(self.hook("build-stops.py", start, front)[0]))
+            self.assertIn("with the item, the user-visible result and what done means", context(self.hook("build-stops.py", start, front)[0]))
             self.assertEqual(self.hook("build-stops.py", start, back)[0], "")
             target = os.path.join(repo, "src", "a.py")
             edit = {"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "Edit", "cwd": home, "tool_input": {"file_path": target}}

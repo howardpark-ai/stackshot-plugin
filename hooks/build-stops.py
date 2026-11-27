@@ -6,8 +6,8 @@ all code: a local lookup of the pane's name and role, no model call, nothing in 
 and the subagents it starts (a subagent's hook call carries its parent's session_id, with an agent_id beside it), never a builder,
 another project's session or the owner's own.
 
-  (a) SessionStart (startup, resume, compact): one line telling the agent that its build work goes to its builder, with the item and
-      what done means, and that it may still read code. A project configured with "stopped": false gets this stop alone.
+  (a) SessionStart (startup, resume, compact): one line telling the agent that its build work goes to its builder, with the item, the
+      user-visible result and what done means, and that it may still read code. A project configured with "stopped": false gets this stop alone.
   (b) PreToolUse Edit, Write, MultiEdit, NotebookEdit: a file inside a guarded repository is refused, before any work is spent.
       Bash too, for the obvious writes whose target is inside one: a redirection, tee, sed/perl -i on an existing file, cp, mv,
       install, rsync, ln, rm, rmdir, touch, mkdir, truncate, and git apply, am, cherry-pick, revert, mv, rm. Reading always passes,
@@ -535,7 +535,7 @@ def read_command(cmd, cwd):
 def start_text(name, project):
     p = PROJECTS[project]
     s = (f"[build-stops] You ({name}) are a front agent of {p['short']}: your build work (code, commits, pull requests, "
-         f"merges, deploys) goes to {handoff(project)} ({REPORT_ON_ITEM}); hand it over with the item and what done means. You may still read code.")
+         f"merges, deploys) goes to {handoff(project)} ({REPORT_ON_ITEM}); hand it over with the item, the user-visible result and what done means. You may still read code.")
     if project in STOPPED:
         s += (" In the guarded repositories a code edit is refused, and a commit, push, PR or merge goes "
               "through with a warning.")
@@ -545,7 +545,7 @@ def start_text(name, project):
 def edit_text(name, repo, target, tool):
     b = h = handoff(repo["project"])
     what = f"a code edit in {repo['slug']} ({target})" if tool != "Bash" else f"this shell command writes into {repo['slug']} ({target}), which"
-    return (f"{name} is a front agent: {what} is {b}'s work. Hand the job to {h} with the item and what done means ({REPORT_ON_ITEM}), before "
+    return (f"{name} is a front agent: {what} is {b}'s work. Hand the job to {h} with the item, the user-visible result and what done means ({REPORT_ON_ITEM}), before "
             f"any work is spent; reading the code is fine. {TAG}")
 
 
